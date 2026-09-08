@@ -1,31 +1,13 @@
-"""
-api/websocket_routes.py
-
-WebSocket endpoint: full voice agent pipeline.
-
-Pipeline order per turn:
-  VAD speech_ended
-    → Whisper STT
-    → Load/create MongoDB session
-    → Retrieve RAG chunks
-    → build_gemini_context()   [3-phase memory]
-    → Gemini LLM
-    → bot_response
-    → ElevenLabs TTS
-    → Send audio + transcript via WebSocket
-    → asyncio.create_task(summarize_exchange_in_background())
-    → Update session state (last_messages, message_count)
-"""
-
 import asyncio
+from typing import Any, Dict, Optional
 
+from elevenlabs.core.api_error import ApiError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from google.genai.errors import APIError as GeminiApiError
 
-from audio.stt_whisper import whisper_stt
+from audio.stt_deepgram import deepgram_stt
 from call.call_state_machine import CallState
 from call.session_manager import Session, session_manager
-from elevenlabs.core.api_error import ApiError
-from google.genai.errors import APIError as GeminiApiError
 from llm.gemini_service import AllGeminiKeysExhausted, gemini_service
 from memory.context_builder import build_gemini_context
 from memory.memory_manager import memory_manager
@@ -34,197 +16,808 @@ from rag.retriever import retriever
 from tts.voice_manager import AllElevenLabsKeysExhausted, voice_manager
 from utils.logger import get_logger
 
+
 logger = get_logger(__name__)
 router = APIRouter()
 
-_MIN_TRANSCRIPT_LENGTH = 4
-_JUNK_PHRASES = frozenset([". . .", "...", "you", "bye", "thanks", "thank you"])
-
-# Minimum audio duration (seconds) to bother transcribing — prevents Whisper
-# wasting time on sub-200ms noise bursts that passed VAD.
-_MIN_AUDIO_DURATION_SECONDS = 0.4
-
-
-async def _handle_speech_started(session: Session, websocket: WebSocket) -> None:
-    if session.state_machine.state == CallState.SPEAKING:
-        # Barge-in disabled — ignore speech while agent is talking
-        return
-    session.utterance_buffer.reset()
+_MIN_TRANSCRIPT_LENGTH = 2
+_JUNK_PHRASES = frozenset({
+    "...",
+    ". . .",
+})
 
 
-async def _handle_speech_ended(session: Session, websocket: WebSocket) -> None:
-    """
-    Full turn processing pipeline.
-    Always returns the session to LISTENING state — even on errors —
-    so the agent never gets permanently stuck in THINKING.
-    """
-    audio = session.utterance_buffer.get_audio()
-    session.utterance_buffer.reset()
+def _valid_transcript(text: str) -> bool:
+    text = text.strip()
 
-    if not audio:
-        return
-
-    # Reject very short audio bursts that slipped past VAD (< 400ms)
-    duration = len(audio) / 2 / 16000  # 16-bit mono at 16kHz
-    if duration < _MIN_AUDIO_DURATION_SECONDS:
-        logger.info(f"[{session.session_id}] Audio too short ({duration:.2f}s) — skipping")
-        return
-
-    session.interrupted = False
-
-    # Guard against concurrent processing
-    if session.state_machine.state != CallState.LISTENING:
-        logger.info(f"[{session.session_id}] Skipping — still processing previous turn")
-        return
-
-    session.state_machine.transition(CallState.THINKING)
-
-    try:
-        await _process_turn(session, websocket, audio)
-    except Exception as e:
-        logger.error(f"[{session.session_id}] Unhandled error in turn processing: {e}")
-    finally:
-        # ALWAYS return to LISTENING so the session is never stuck
-        if session.state_machine.state != CallState.LISTENING:
-            session.state_machine.interrupt()
-
-
-async def _process_turn(session: Session, websocket: WebSocket, audio: bytes) -> None:
-    """Inner pipeline — separated so _handle_speech_ended can always clean up."""
-
-    # ── STT ───────────────────────────────────────────────────────────────────
-    user_text = await asyncio.to_thread(whisper_stt.transcribe, audio, language="en")
-
-    if not user_text or len(user_text.strip()) < _MIN_TRANSCRIPT_LENGTH:
-        logger.info(f"[{session.session_id}] Transcript too short or empty — skipping")
-        return
-
-    if user_text.strip().lower() in _JUNK_PHRASES:
-        logger.info(f"[{session.session_id}] Filtered junk: '{user_text}'")
-        return
-
-    await websocket.send_json({"type": "transcript", "text": user_text})
-
-    # ── Session: get pre-increment message count ───────────────────────────────
-    # Returns count BEFORE incrementing: 0=Phase1, 1=Phase2, 2+=Phase3
-    message_count = await memory_manager.increment_message_count(session.session_id)
-
-    # ── RAG retrieval ─────────────────────────────────────────────────────────
-    retrieved_context = await asyncio.to_thread(retriever.retrieve, user_text)
-
-    # ── Build memory context (3-phase algorithm) ──────────────────────────────
-    contents = await build_gemini_context(
-        session_id=session.session_id,
-        new_user_text=user_text,
-        retrieved_context=retrieved_context,
-        message_count=message_count,
+    return (
+        len(text) >= _MIN_TRANSCRIPT_LENGTH
+        and text.lower() not in _JUNK_PHRASES
     )
 
-    # ── Gemini LLM ────────────────────────────────────────────────────────────
-    try:
-        bot_text = await asyncio.to_thread(
-            gemini_service.generate_reply_from_contents, contents
+
+def _plain_alignment(
+    value: Any,
+) -> Optional[Dict[str, list]]:
+
+    if not value:
+        return None
+
+    if (
+        hasattr(value, "model_dump")
+        and callable(value.model_dump)
+    ):
+        try:
+            value = value.model_dump()
+        except Exception:
+            return None
+
+    if not isinstance(value, dict):
+        return None
+
+    chars_raw = (
+        value.get("chars")
+        or value.get("characters")
+    )
+
+    starts_raw = (
+        value.get("char_start_times_ms")
+        or value.get("charStartTimesMs")
+        or value.get(
+            "character_start_times_ms"
         )
-    except AllGeminiKeysExhausted:
-        logger.error(f"[{session.session_id}] All Gemini keys exhausted")
-        return
-    except GeminiApiError as e:
-        logger.error(f"[{session.session_id}] Gemini API error: {e}")
-        return
-
-    if not bot_text:
-        logger.warning(f"[{session.session_id}] Gemini returned empty reply — skipping TTS")
-        return
-
-    # ── ElevenLabs TTS ────────────────────────────────────────────────────────
-    session.state_machine.transition(CallState.SPEAKING)
-
-    try:
-        reply_audio = await asyncio.to_thread(voice_manager.synthesize, bot_text)
-    except AllElevenLabsKeysExhausted:
-        logger.error(f"[{session.session_id}] All ElevenLabs accounts exhausted")
-        session.state_machine.interrupt()
-        return
-    except ApiError as e:
-        logger.error(f"[{session.session_id}] ElevenLabs TTS error: {e}")
-        session.state_machine.interrupt()
-        return
-
-    # ── Send response ─────────────────────────────────────────────────────────
-    if session.interrupted:
-        logger.info(f"[{session.session_id}] Reply discarded — barge-in during synthesis")
-    else:
-        await websocket.send_json({"type": "reply_text", "text": bot_text})
-        await websocket.send_bytes(reply_audio)
-
-    if session.state_machine.state == CallState.SPEAKING:
-        session.state_machine.transition(CallState.LISTENING)
-
-    # ── Non-blocking background summarization ─────────────────────────────────
-    await summarize_exchange_in_background(
-        session_id=session.session_id,
-        user_text=user_text,
-        bot_text=bot_text,
-        message_count=message_count,
     )
 
-    # ── Update last_messages in MongoDB (used for Phase 2 context) ───────────
-    asyncio.create_task(
+    durations_raw = (
+        value.get("char_durations_ms")
+        or value.get("charsDurationsMs")
+        or value.get("charDurationsMs")
+        or value.get(
+            "character_durations_ms"
+        )
+    )
+
+    if (
+        callable(chars_raw)
+        or callable(starts_raw)
+        or callable(durations_raw)
+    ):
+        return None
+
+    if not isinstance(
+        chars_raw,
+        (list, tuple),
+    ):
+        return None
+
+    if not isinstance(
+        starts_raw,
+        (list, tuple),
+    ):
+        return None
+
+    if not isinstance(
+        durations_raw,
+        (list, tuple),
+    ):
+        durations_raw = []
+
+    chars = []
+    starts = []
+    durations = []
+
+    count = min(
+        len(chars_raw),
+        len(starts_raw),
+    )
+
+    for i in range(count):
+        char = chars_raw[i]
+        start = starts_raw[i]
+
+        duration = (
+            durations_raw[i]
+            if i < len(durations_raw)
+            else 0
+        )
+
+        if not isinstance(char, str):
+            continue
+
+        if (
+            isinstance(start, bool)
+            or not isinstance(
+                start,
+                (int, float),
+            )
+        ):
+            continue
+
+        if (
+            isinstance(duration, bool)
+            or not isinstance(
+                duration,
+                (int, float),
+            )
+        ):
+            duration = 0
+
+        chars.append(char)
+        starts.append(float(start))
+        durations.append(
+            float(duration)
+        )
+
+    if not chars:
+        return None
+
+    return {
+        "chars": chars,
+        "char_start_times_ms": starts,
+        "char_durations_ms": durations,
+    }
+
+
+async def _send_error(
+    websocket: WebSocket,
+    message: str,
+) -> None:
+
+    try:
+        await websocket.send_json({
+            "type": "error",
+            "message": message,
+        })
+
+    except Exception:
+        pass
+
+
+async def _post_turn_updates(
+    session: Session,
+    user_text: str,
+    bot_text: str,
+    message_count: int,
+) -> None:
+
+    results = await asyncio.gather(
+        summarize_exchange_in_background(
+            session_id=session.session_id,
+            user_text=user_text,
+            bot_text=bot_text,
+            message_count=message_count,
+        ),
         memory_manager.update_last_messages(
             session_id=session.session_id,
             user_message=user_text,
             assistant_message=bot_text,
-        )
+        ),
+        return_exceptions=True,
     )
 
-    # Mirror to in-RAM session
-    session.conversation_history.append({"role": "user", "text": user_text})
-    session.conversation_history.append({"role": "model", "text": bot_text})
-    session.message_count = message_count + 1
-    session.last_messages = {"user": user_text, "assistant": bot_text}
+    for result in results:
+        if isinstance(
+            result,
+            Exception,
+        ):
+            logger.warning(
+                f"[{session.session_id}] "
+                f"Background memory update failed: "
+                f"{result}"
+            )
+
+
+async def _process_turn(
+    session: Session,
+    websocket: WebSocket,
+    user_text: str,
+) -> None:
+
+    user_text = " ".join(
+        user_text.split()
+    ).strip()
+
+    if not _valid_transcript(
+        user_text
+    ):
+        logger.info(
+            f"[{session.session_id}] "
+            f"Transcript ignored: "
+            f"'{user_text}'"
+        )
+        return
+
+    if (
+        session.state_machine.state
+        != CallState.LISTENING
+    ):
+        logger.info(
+            f"[{session.session_id}] "
+            "Ignoring transcript while agent is busy"
+        )
+        return
+
+    session.interrupted = False
+
+    session.state_machine.transition(
+        CallState.THINKING
+    )
+
+    try:
+
+        await websocket.send_json({
+            "type": "transcript",
+            "text": user_text,
+        })
+
+        (
+            message_count,
+            retrieved_context,
+        ) = await asyncio.gather(
+
+            memory_manager
+            .increment_message_count(
+                session.session_id
+            ),
+
+            asyncio.to_thread(
+                retriever.retrieve,
+                user_text,
+            ),
+        )
+
+        contents = await build_gemini_context(
+            session_id=session.session_id,
+            new_user_text=user_text,
+            retrieved_context=retrieved_context,
+            message_count=message_count,
+        )
+
+        bot_parts = []
+
+        async def gemini_text_stream():
+
+            async for chunk in (
+                gemini_service
+                .generate_reply_stream_from_contents(
+                    contents
+                )
+            ):
+
+                if not chunk:
+                    continue
+
+                bot_parts.append(chunk)
+
+                yield chunk
+
+        session.state_machine.transition(
+            CallState.SPEAKING
+        )
+
+        audio_started = False
+
+        try:
+
+            await websocket.send_json({
+                "type": "audio_start",
+            })
+
+            audio_started = True
+
+            async for packet in (
+                voice_manager.stream(
+                    gemini_text_stream()
+                )
+            ):
+
+                if session.interrupted:
+
+                    logger.info(
+                        f"[{session.session_id}] "
+                        "Reply interrupted"
+                    )
+
+                    break
+
+                audio = b""
+                alignment = None
+
+                if isinstance(
+                    packet,
+                    (
+                        bytes,
+                        bytearray,
+                        memoryview,
+                    ),
+                ):
+
+                    audio = bytes(packet)
+
+                elif isinstance(
+                    packet,
+                    dict,
+                ):
+
+                    raw_audio = packet.get(
+                        "audio",
+                        b"",
+                    )
+
+                    if isinstance(
+                        raw_audio,
+                        (
+                            bytes,
+                            bytearray,
+                            memoryview,
+                        ),
+                    ):
+                        audio = bytes(
+                            raw_audio
+                        )
+
+                    raw_alignment = (
+                        packet.get(
+                            "alignment"
+                        )
+                        or packet.get(
+                            "normalized_alignment"
+                        )
+                        or packet.get(
+                            "normalizedAlignment"
+                        )
+                    )
+
+                    alignment = (
+                        _plain_alignment(
+                            raw_alignment
+                        )
+                    )
+
+                else:
+
+                    logger.warning(
+                        f"[{session.session_id}] "
+                        "Unsupported ElevenLabs "
+                        f"packet type: "
+                        f"{type(packet).__name__}"
+                    )
+
+                if alignment:
+
+                    await websocket.send_json({
+                        "type": "audio_alignment",
+                        "alignment": alignment,
+                    })
+
+                if audio:
+
+                    await websocket.send_bytes(
+                        audio
+                    )
+
+        except AllGeminiKeysExhausted:
+
+            logger.error(
+                f"[{session.session_id}] "
+                "All Gemini API keys exhausted"
+            )
+
+            await _send_error(
+                websocket,
+                "AI service is temporarily unavailable.",
+            )
+
+            return
+
+        except GeminiApiError as exc:
+
+            logger.error(
+                f"[{session.session_id}] "
+                f"Gemini API error: {exc}"
+            )
+
+            await _send_error(
+                websocket,
+                "AI response generation failed.",
+            )
+
+            return
+
+        except AllElevenLabsKeysExhausted:
+
+            logger.error(
+                f"[{session.session_id}] "
+                "All ElevenLabs accounts exhausted"
+            )
+
+            await _send_error(
+                websocket,
+                "Voice generation is temporarily unavailable.",
+            )
+
+            return
+
+        except ApiError as exc:
+
+            logger.error(
+                f"[{session.session_id}] "
+                f"ElevenLabs error: {exc}"
+            )
+
+            await _send_error(
+                websocket,
+                "Voice generation failed.",
+            )
+
+            return
+
+        except Exception as exc:
+
+            logger.exception(
+                f"[{session.session_id}] "
+                f"Streaming response failed: "
+                f"{exc}"
+            )
+
+            await _send_error(
+                websocket,
+                "Voice response failed.",
+            )
+
+            return
+
+        finally:
+
+            if audio_started:
+
+                try:
+
+                    await websocket.send_json({
+                        "type": "audio_end",
+                    })
+
+                except Exception:
+                    pass
+
+        if session.interrupted:
+            return
+
+        bot_text = "".join(
+            bot_parts
+        ).strip()
+
+        if not bot_text:
+
+            logger.warning(
+                f"[{session.session_id}] "
+                "Gemini returned empty response"
+            )
+
+            await _send_error(
+                websocket,
+                "The agent could not generate a response.",
+            )
+
+            return
+
+        session.conversation_history.extend([
+            {
+                "role": "user",
+                "text": user_text,
+            },
+            {
+                "role": "model",
+                "text": bot_text,
+            },
+        ])
+
+        session.message_count = (
+            message_count + 1
+        )
+
+        session.last_messages = {
+            "user": user_text,
+            "assistant": bot_text,
+        }
+
+        asyncio.create_task(
+            _post_turn_updates(
+                session=session,
+                user_text=user_text,
+                bot_text=bot_text,
+                message_count=message_count,
+            )
+        )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+
+        logger.exception(
+            f"[{session.session_id}] "
+            f"Turn processing failed: "
+            f"{exc}"
+        )
+
+        await _send_error(
+            websocket,
+            "Something went wrong. Please try again.",
+        )
+
+    finally:
+
+        if (
+            session.state_machine.state
+            != CallState.LISTENING
+        ):
+
+            session.state_machine.interrupt()
+
+
+async def _consume_deepgram_utterances(
+    session: Session,
+    websocket: WebSocket,
+    deepgram_session,
+) -> None:
+
+    try:
+
+        while True:
+
+            user_text = await (
+                deepgram_session
+                .next_utterance()
+            )
+
+            if not user_text:
+                continue
+
+            await _process_turn(
+                session=session,
+                websocket=websocket,
+                user_text=user_text,
+            )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+
+        logger.error(
+            f"[{session.session_id}] "
+            f"Deepgram consumer error: "
+            f"{exc}"
+        )
 
 
 @router.websocket("/ws/call")
-async def call_websocket(websocket: WebSocket):
+async def call_websocket(
+    websocket: WebSocket,
+) -> None:
+
     await websocket.accept()
 
-    session = session_manager.create_session()
-    await memory_manager.create_session(session.session_id)
+    session = (
+        session_manager
+        .create_session()
+    )
 
-    await websocket.send_json({
-        "type": "session_started",
-        "session_id": session.session_id,
-    })
-    await websocket.send_json({"type": "play_greeting"})
+    deepgram_session = None
+    utterance_task = None
+    memory_task = None
+    deepgram_task = None
 
     try:
+
+        memory_task = (
+            asyncio.create_task(
+                memory_manager
+                .create_session(
+                    session.session_id
+                )
+            )
+        )
+
+        deepgram_task = (
+            asyncio.create_task(
+                deepgram_stt
+                .create_session(
+                    session.session_id
+                )
+            )
+        )
+
+        await websocket.send_json({
+            "type": "session_started",
+            "session_id": (
+                session.session_id
+            ),
+        })
+
+        await websocket.send_json({
+            "type": "play_greeting",
+        })
+
+        (
+            memory_result,
+            deepgram_result,
+        ) = await asyncio.gather(
+            memory_task,
+            deepgram_task,
+            return_exceptions=True,
+        )
+
+        if isinstance(
+            memory_result,
+            Exception,
+        ):
+            raise memory_result
+
+        if isinstance(
+            deepgram_result,
+            Exception,
+        ):
+            raise deepgram_result
+
+        deepgram_session = (
+            deepgram_result
+        )
+
+        logger.info(
+            f"[{session.session_id}] "
+            "Voice pipeline ready ✅ "
+            f"(Deepgram key "
+            f"{deepgram_session.active_key_number})"
+        )
+
+        utterance_task = (
+            asyncio.create_task(
+                _consume_deepgram_utterances(
+                    session=session,
+                    websocket=websocket,
+                    deepgram_session=deepgram_session,
+                ),
+                name=(
+                    "deepgram-consumer-"
+                    f"{session.session_id}"
+                ),
+            )
+        )
+
         while True:
-            message = await websocket.receive()
 
-            if message["type"] == "websocket.disconnect":
-                raise WebSocketDisconnect(code=message.get("code", 1000))
+            message = (
+                await websocket.receive()
+            )
 
-            if "bytes" in message and message["bytes"] is not None:
-                frames = session.frame_buffer.push(message["bytes"])
+            if (
+                message["type"]
+                == "websocket.disconnect"
+            ):
 
-                for frame in frames:
-                    event = session.vad.process_frame(frame)
+                raise WebSocketDisconnect(
+                    code=message.get(
+                        "code",
+                        1000,
+                    )
+                )
 
-                    if event == "speech_started":
-                        await _handle_speech_started(session, websocket)
-                    elif event == "speech_ended":
-                        asyncio.create_task(_handle_speech_ended(session, websocket))
+            pcm_bytes = message.get(
+                "bytes"
+            )
 
-                    if session.vad.is_speaking:
-                        session.utterance_buffer.add(frame)
+            if pcm_bytes is not None:
 
-            elif "text" in message and message["text"] is not None:
-                logger.info(f"[{session.session_id}] Control: {message['text']}")
+                if (
+                    session.state_machine.state
+                    == CallState.LISTENING
+                ):
+
+                    await (
+                        deepgram_session
+                        .send_audio(
+                            pcm_bytes
+                        )
+                    )
+
+                continue
+
+            control = message.get(
+                "text"
+            )
+
+            if control is not None:
+
+                logger.debug(
+                    f"[{session.session_id}] "
+                    f"Control: {control}"
+                )
 
     except WebSocketDisconnect:
-        logger.info(f"[{session.session_id}] Client disconnected")
-    except Exception as e:
-        logger.error(f"[{session.session_id}] WebSocket error: {e}")
+
+        logger.info(
+            f"[{session.session_id}] "
+            "Client disconnected"
+        )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+
+        logger.exception(
+            f"[{session.session_id}] "
+            f"WebSocket error: "
+            f"{exc}"
+        )
+
+        await _send_error(
+            websocket,
+            "Voice agent initialization failed.",
+        )
+
     finally:
-        session_manager.end_session(session.session_id)
-        logger.info(f"[{session.session_id}] Session cleaned up")
+
+        if utterance_task:
+
+            utterance_task.cancel()
+
+            await asyncio.gather(
+                utterance_task,
+                return_exceptions=True,
+            )
+
+        for task in (
+            memory_task,
+            deepgram_task,
+        ):
+
+            if (
+                task
+                and not task.done()
+            ):
+                task.cancel()
+
+        pending_tasks = [
+            task
+            for task in (
+                memory_task,
+                deepgram_task,
+            )
+            if task
+        ]
+
+        if pending_tasks:
+
+            await asyncio.gather(
+                *pending_tasks,
+                return_exceptions=True,
+            )
+
+        if deepgram_session:
+
+            try:
+
+                await (
+                    deepgram_session
+                    .close()
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    f"[{session.session_id}] "
+                    "Deepgram cleanup failed: "
+                    f"{exc}"
+                )
+
+        session_manager.end_session(
+            session.session_id
+        )
+
+        logger.info(
+            f"[{session.session_id}] "
+            "Session cleaned up"
+        )
