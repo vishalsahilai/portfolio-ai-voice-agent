@@ -5,56 +5,91 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    #  Server 
+    # Server
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 8001
     LOG_LEVEL: str = "INFO"
 
-    #  LLM (Gemini) 
+    # Gemini
     GEMINI_API_KEY1: str = ""
     GEMINI_API_KEY2: str = ""
     GEMINI_API_KEY3: str = ""
     GEMINI_API_KEY4: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash-lite"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     @property
     def GEMINI_API_KEYS(self) -> List[str]:
-        """Ordered rotation pool — empty/unset slots are dropped automatically."""
-        keys = [self.GEMINI_API_KEY1, self.GEMINI_API_KEY2, self.GEMINI_API_KEY3, self.GEMINI_API_KEY4]
-        return [k for k in keys if k.strip()]
+        return [
+            key.strip()
+            for key in (
+                self.GEMINI_API_KEY1,
+                self.GEMINI_API_KEY2,
+                self.GEMINI_API_KEY3,
+                self.GEMINI_API_KEY4,
+            )
+            if key.strip()
+        ]
 
-    #  STT (Whisper, local/open-source) 
-    WHISPER_MODEL_SIZE: str = "Systran/faster-distil-whisper-medium.en"  # tiny | base | small | medium | large
-    WHISPER_DEVICE: str = "cpu"  # cpu | cuda
+    # Deepgram STT
+    DEEPGRAM_API_KEY1: str = ""
+    DEEPGRAM_API_KEY2: str = ""
+    DEEPGRAM_API_KEY3: str = ""
+    DEEPGRAM_API_KEY4: str = ""
 
-    #  TTS (ElevenLabs) 
+    DEEPGRAM_MODEL: str = "nova-3"
+    DEEPGRAM_LANGUAGE: str = "en-US"
+    DEEPGRAM_ENDPOINTING_MS: int = 350
+    DEEPGRAM_UTTERANCE_END_MS: int = 1000
+
+    @property
+    def DEEPGRAM_API_KEYS(self) -> List[str]:
+        return [
+            key.strip()
+            for key in (
+                self.DEEPGRAM_API_KEY1,
+                self.DEEPGRAM_API_KEY2,
+                self.DEEPGRAM_API_KEY3,
+                self.DEEPGRAM_API_KEY4,
+            )
+            if key.strip()
+        ]
+
+    # ElevenLabs TTS
     ELEVENLABS_API_KEYS1: str = ""
     ELEVENLABS_VOICE_ID1: str = ""
+
     ELEVENLABS_API_KEYS2: str = ""
     ELEVENLABS_VOICE_ID2: str = ""
+
     ELEVENLABS_API_KEYS3: str = ""
     ELEVENLABS_VOICE_ID3: str = ""
+
     ELEVENLABS_API_KEYS4: str = ""
     ELEVENLABS_VOICE_ID4: str = ""
+
     ELEVENLABS_API_KEYS5: str = ""
     ELEVENLABS_VOICE_ID5: str = ""
+
     ELEVENLABS_API_KEYS6: str = ""
     ELEVENLABS_VOICE_ID6: str = ""
+
     ELEVENLABS_API_KEYS7: str = ""
     ELEVENLABS_VOICE_ID7: str = ""
+
     ELEVENLABS_API_KEYS8: str = ""
     ELEVENLABS_VOICE_ID8: str = ""
+
     ELEVENLABS_MODEL_ID: str = "eleven_flash_v2_5"
 
     @property
     def ELEVENLABS_ACCOUNT_POOL(self) -> List[dict]:
-        """
-        Ordered list of {"api_key": ..., "voice_id": ...} pairs — a
-        slot is only included if BOTH its key and voice ID are set.
-        """
-        pairs = [
+        pairs = (
             (self.ELEVENLABS_API_KEYS1, self.ELEVENLABS_VOICE_ID1),
             (self.ELEVENLABS_API_KEYS2, self.ELEVENLABS_VOICE_ID2),
             (self.ELEVENLABS_API_KEYS3, self.ELEVENLABS_VOICE_ID3),
@@ -63,28 +98,35 @@ class Settings(BaseSettings):
             (self.ELEVENLABS_API_KEYS6, self.ELEVENLABS_VOICE_ID6),
             (self.ELEVENLABS_API_KEYS7, self.ELEVENLABS_VOICE_ID7),
             (self.ELEVENLABS_API_KEYS8, self.ELEVENLABS_VOICE_ID8),
-        ]
+        )
+
         return [
-            {"api_key": key.strip(), "voice_id": voice.strip()}
-            for key, voice in pairs
-            if key.strip() and voice.strip()
+            {
+                "api_key": api_key.strip(),
+                "voice_id": voice_id.strip(),
+            }
+            for api_key, voice_id in pairs
+            if api_key.strip() and voice_id.strip()
         ]
 
-    #  Audio 
+    # Audio
     AUDIO_SAMPLE_RATE: int = 16000
-    AUDIO_CHUNK_MS: int = 30  
-    SILENCE_THRESHOLD_MS: int = 700  
 
-    #  RAG (Pinecone + HuggingFace)
+    # Kept temporarily for compatibility with old call/VAD classes.
+    AUDIO_CHUNK_MS: int = 30
+    SILENCE_THRESHOLD_MS: int = 700
+
+    # Pinecone / RAG
     PINECONE_API_KEY: str = ""
     PINECONE_INDEX_NAME: str = "voice-agent"
     PINECONE_CLOUD: str = "aws"
     PINECONE_REGION: str = "us-east-1"
-    EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    EMBEDDING_MODEL_NAME: str = "llama-text-embed-v2"
     EMBEDDING_DIMENSION: int = 384
     RAG_TOP_K: int = 3
 
-    # Memory (MongoDB)
+    # MongoDB
     MONGODB_URI: str = ""
     MONGODB_DB_NAME: str = "ai_voice_agent"
     SESSION_EXPIRY_HOURS: int = 2
@@ -92,7 +134,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Settings are read from env once and cached — call get_settings() anywhere you need config."""
     return Settings()
 
 
