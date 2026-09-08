@@ -1,16 +1,14 @@
 import asyncio
 import base64
-from ctypes import alignment
 import json
 from threading import Lock
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Optional
 from urllib.parse import urlencode
 
 from elevenlabs import ElevenLabs
 from elevenlabs.core.api_error import ApiError
-from websockets import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 from websockets.legacy.client import connect as websocket_connect
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config.settings import settings
 from utils.logger import get_logger
@@ -35,14 +33,10 @@ class ElevenLabsStreamError(Exception):
 class ElevenLabsVoiceManager:
     def __init__(
         self,
-        account_pool: Optional[List[dict]] = None,
+        account_pool: Optional[list[dict]] = None,
         model_id: Optional[str] = None,
     ):
-        self.account_pool = (
-            account_pool
-            if account_pool is not None
-            else settings.ELEVENLABS_ACCOUNT_POOL
-        )
+        self.account_pool = account_pool if account_pool is not None else settings.ELEVENLABS_ACCOUNT_POOL
         self.model_id = model_id or settings.ELEVENLABS_MODEL_ID
         self._current_index = 0
         self._lock = Lock()
@@ -74,9 +68,7 @@ class ElevenLabsVoiceManager:
             account = self.account_pool[index]
 
             try:
-                client = ElevenLabs(
-                    api_key=account["api_key"]
-                )
+                client = ElevenLabs(api_key=account["api_key"])
 
                 audio = client.text_to_speech.convert(
                     voice_id=account["voice_id"],
@@ -92,8 +84,8 @@ class ElevenLabsVoiceManager:
                     raise
 
                 logger.warning(
-                    f"ElevenLabs account {index + 1}/{total} "
-                    f"failed ({getattr(exc, 'status_code', 'unknown')})"
+                    f"ElevenLabs account {index + 1}/{total} failed "
+                    f"({getattr(exc, 'status_code', 'unknown')})"
                 )
 
         raise AllElevenLabsKeysExhausted(
@@ -108,10 +100,7 @@ class ElevenLabsVoiceManager:
             "inactivity_timeout": 60,
         })
 
-        return (
-            f"{ELEVENLABS_WS}/"
-            f"{voice_id}/stream-input?{query}"
-        )
+        return f"{ELEVENLABS_WS}/{voice_id}/stream-input?{query}"
 
     async def _connect_stream(self):
         if not self.account_pool:
@@ -128,12 +117,8 @@ class ElevenLabsVoiceManager:
             try:
                 ws = await asyncio.wait_for(
                     websocket_connect(
-                        self._build_ws_url(
-                            account["voice_id"]
-                        ),
-                        extra_headers={
-                            "xi-api-key": account["api_key"]
-                        },
+                        self._build_ws_url(account["voice_id"]),
+                        extra_headers={"xi-api-key": account["api_key"]},
                         ping_interval=20,
                         ping_timeout=20,
                         close_timeout=5,
@@ -143,25 +128,18 @@ class ElevenLabsVoiceManager:
                     timeout=CONNECT_TIMEOUT,
                 )
 
-                await ws.send(
-                    json.dumps({
-                        "text": " ",
-                        "voice_settings": {
-                            "stability": 0.5,
-                            "similarity_boost": 0.8,
-                            "speed": 1.0,
-                            "use_speaker_boost": False,
-                        },
-                        "generation_config": {
-                            "chunk_length_schedule": [
-                                50,
-                                90,
-                                140,
-                                200,
-                            ]
-                        },
-                    })
-                )
+                await ws.send(json.dumps({
+                    "text": " ",
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.8,
+                        "speed": 1.0,
+                        "use_speaker_boost": False,
+                    },
+                    "generation_config": {
+                        "chunk_length_schedule": [50, 90, 140, 200]
+                    },
+                }))
 
                 self._set_index(index)
 
@@ -179,9 +157,8 @@ class ElevenLabsVoiceManager:
                 last_error = exc
 
                 logger.warning(
-                    f"ElevenLabs account "
-                    f"{index + 1}/{total} connection failed: "
-                    f"{type(exc).__name__}"
+                    f"ElevenLabs account {index + 1}/{total} "
+                    f"connection failed: {type(exc).__name__}"
                 )
 
         raise AllElevenLabsKeysExhausted(
@@ -200,55 +177,43 @@ class ElevenLabsVoiceManager:
                 continue
 
             buffer += chunk
-
-            cut = max(
-                buffer.rfind(" "),
-                buffer.rfind("\n"),
-            )
+            cut = max(buffer.rfind(" "), buffer.rfind("\n"))
 
             if cut < 0:
                 continue
 
-            text = buffer[:cut + 1]
-            buffer = buffer[cut + 1:]
+            text, buffer = buffer[:cut + 1], buffer[cut + 1:]
 
             if text.strip():
-                await ws.send(
-                    json.dumps({"text": text})
-                )
+                await ws.send(json.dumps({"text": text}))
 
         if buffer.strip():
-            await ws.send(
-                json.dumps({
-                    "text": buffer,
-                    "flush": True,
-                })
-            )
+            await ws.send(json.dumps({
+                "text": buffer.rstrip() + " ",
+                "flush": True,
+            }))
+        else:
+            await ws.send(json.dumps({
+                "text": " ",
+                "flush": True,
+            }))
 
-        await ws.send(
-            json.dumps({"text": ""})
-        )
+        await ws.send(json.dumps({"text": ""}))
 
-        async def stream(
+    async def stream(
         self,
         text_stream: AsyncIterator[str],
     ) -> AsyncIterator[dict]:
-            ws = await self._connect_stream()
+        ws = await self._connect_stream()
 
         sender = asyncio.create_task(
-            self._send_text_stream(
-                ws,
-                text_stream,
-            )
+            self._send_text_stream(ws, text_stream)
         )
 
         receiver = None
-        audio_started = False
 
         try:
-            receiver = asyncio.create_task(
-                ws.recv()
-            )
+            receiver = asyncio.create_task(ws.recv())
 
             while True:
                 active = {receiver}
@@ -263,112 +228,59 @@ class ElevenLabsVoiceManager:
 
                 if sender in done:
                     error = sender.exception()
-
                     if error:
                         raise error
 
-                if receiver in done:
-                    raw = receiver.result()
+                if receiver not in done:
+                    continue
 
-                    if isinstance(raw, bytes):
-                        audio_started = True
+                raw = receiver.result()
 
+                if isinstance(raw, bytes):
+                    yield {
+                        "audio": raw,
+                        "alignment": None,
+                    }
+
+                else:
+                    message = json.loads(raw)
+
+                    audio_b64 = message.get("audio")
+
+                    alignment = (
+                        message.get("alignment")
+                        or message.get("normalizedAlignment")
+                        or message.get("normalized_alignment")
+                    )
+
+                    audio_bytes = (
+                        base64.b64decode(audio_b64)
+                        if isinstance(audio_b64, str) and audio_b64
+                        else b""
+                    )
+
+                    if audio_bytes or isinstance(alignment, dict):
                         yield {
-                            "audio": raw,
-                            "alignment": None,
+                            "audio": audio_bytes,
+                            "alignment": alignment if isinstance(alignment, dict) else None,
                         }
 
-                    else:
-                        message = json.loads(raw)
+                    if message.get("is_final") or message.get("isFinal"):
+                        logger.info("ElevenLabs stream finished ✅")
+                        break
 
-                        audio_b64 = message.get(
-                            "audio"
-                        )
-
-                        alignment = (
-                            message.get("alignment")
-                            or message.get(
-                                "normalized_alignment"
-                            )
-                            or message.get(
-                                "normalizedAlignment"
-                            )
-                        )
-
-                        audio_bytes = b""
-
-                        if (
-                            isinstance(
-                                audio_b64,
-                                str,
-                            )
-                            and audio_b64
-                        ):
-                            audio_bytes = (
-                                base64.b64decode(
-                                    audio_b64
-                                )
-                            )
-
-                        if audio_bytes:
-                            audio_started = True
-
-                        if (
-                            audio_bytes
-                            or isinstance(
-                                alignment,
-                                dict,
-                            )
-                        ):
-                            yield {
-                                "audio": audio_bytes,
-                                "alignment": (
-                                    alignment
-                                    if isinstance(
-                                        alignment,
-                                        dict,
-                                    )
-                                    else None
-                                ),
-                            }
-
-                        if (
-                            message.get(
-                                "is_final"
-                            )
-                            or message.get(
-                                "isFinal"
-                            )
-                        ):
-                            break
-
-                    receiver = (
-                        asyncio.create_task(
-                            ws.recv()
-                        )
-                    )
+                receiver = asyncio.create_task(ws.recv())
 
         except asyncio.CancelledError:
             raise
 
         except ConnectionClosedOK:
-            logger.info(
-                "ElevenLabs WebSocket finished normally ✅"
-            )
+            logger.info("ElevenLabs WebSocket finished normally ✅")
             return
 
         except ConnectionClosed as exc:
-            if (
-                getattr(
-                    exc,
-                    "code",
-                    None,
-                )
-                == 1000
-            ):
-                logger.info(
-                    "ElevenLabs WebSocket finished normally ✅"
-                )
+            if getattr(exc, "code", None) == 1000:
+                logger.info("ElevenLabs WebSocket finished normally ✅")
                 return
 
             raise ElevenLabsStreamError(
@@ -381,32 +293,19 @@ class ElevenLabsVoiceManager:
             ) from exc
 
         finally:
-            for task in (
-                sender,
-                receiver,
-            ):
-                if (
-                    task
-                    and not task.done()
-                ):
+            tasks = [task for task in (sender, receiver) if task]
+
+            for task in tasks:
+                if not task.done():
                     task.cancel()
 
-            await asyncio.gather(
-                *[
-                    task
-                    for task in (
-                        sender,
-                        receiver,
-                    )
-                    if task
-                ],
-                return_exceptions=True,
-            )
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             try:
                 await ws.close()
-
             except Exception:
                 pass
+
 
 voice_manager = ElevenLabsVoiceManager()
