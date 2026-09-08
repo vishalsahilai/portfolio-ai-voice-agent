@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any, Dict, Optional
 
 from elevenlabs.core.api_error import ApiError
@@ -21,32 +22,19 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 _MIN_TRANSCRIPT_LENGTH = 2
-_JUNK_PHRASES = frozenset({
-    "...",
-    ". . .",
-})
+_JUNK_PHRASES = frozenset({"...", ". . ."})
 
 
 def _valid_transcript(text: str) -> bool:
     text = text.strip()
-
-    return (
-        len(text) >= _MIN_TRANSCRIPT_LENGTH
-        and text.lower() not in _JUNK_PHRASES
-    )
+    return len(text) >= _MIN_TRANSCRIPT_LENGTH and text.lower() not in _JUNK_PHRASES
 
 
-def _plain_alignment(
-    value: Any,
-) -> Optional[Dict[str, list]]:
-
+def _plain_alignment(value: Any) -> Optional[Dict[str, list]]:
     if not value:
         return None
 
-    if (
-        hasattr(value, "model_dump")
-        and callable(value.model_dump)
-    ):
+    if hasattr(value, "model_dump") and callable(value.model_dump):
         try:
             value = value.model_dump()
         except Exception:
@@ -55,98 +43,54 @@ def _plain_alignment(
     if not isinstance(value, dict):
         return None
 
-    chars_raw = (
-        value.get("chars")
-        or value.get("characters")
-    )
+    chars_raw = value.get("chars") or value.get("characters")
 
     starts_raw = (
         value.get("char_start_times_ms")
         or value.get("charStartTimesMs")
-        or value.get(
-            "character_start_times_ms"
-        )
+        or value.get("character_start_times_ms")
     )
 
     durations_raw = (
         value.get("char_durations_ms")
         or value.get("charsDurationsMs")
         or value.get("charDurationsMs")
-        or value.get(
-            "character_durations_ms"
-        )
+        or value.get("character_durations_ms")
+        or []
     )
 
-    if (
-        callable(chars_raw)
-        or callable(starts_raw)
-        or callable(durations_raw)
-    ):
+    if callable(chars_raw) or callable(starts_raw) or callable(durations_raw):
         return None
 
-    if not isinstance(
-        chars_raw,
-        (list, tuple),
-    ):
+    if not isinstance(chars_raw, (list, tuple)):
         return None
 
-    if not isinstance(
-        starts_raw,
-        (list, tuple),
-    ):
+    if not isinstance(starts_raw, (list, tuple)):
         return None
 
-    if not isinstance(
-        durations_raw,
-        (list, tuple),
-    ):
+    if not isinstance(durations_raw, (list, tuple)):
         durations_raw = []
 
-    chars = []
-    starts = []
-    durations = []
-
-    count = min(
-        len(chars_raw),
-        len(starts_raw),
-    )
+    chars, starts, durations = [], [], []
+    count = min(len(chars_raw), len(starts_raw))
 
     for i in range(count):
         char = chars_raw[i]
         start = starts_raw[i]
-
-        duration = (
-            durations_raw[i]
-            if i < len(durations_raw)
-            else 0
-        )
+        duration = durations_raw[i] if i < len(durations_raw) else 0
 
         if not isinstance(char, str):
             continue
 
-        if (
-            isinstance(start, bool)
-            or not isinstance(
-                start,
-                (int, float),
-            )
-        ):
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
             continue
 
-        if (
-            isinstance(duration, bool)
-            or not isinstance(
-                duration,
-                (int, float),
-            )
-        ):
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
             duration = 0
 
         chars.append(char)
         starts.append(float(start))
-        durations.append(
-            float(duration)
-        )
+        durations.append(float(duration))
 
     if not chars:
         return None
@@ -158,17 +102,12 @@ def _plain_alignment(
     }
 
 
-async def _send_error(
-    websocket: WebSocket,
-    message: str,
-) -> None:
-
+async def _send_error(websocket: WebSocket, message: str) -> None:
     try:
         await websocket.send_json({
             "type": "error",
             "message": message,
         })
-
     except Exception:
         pass
 
@@ -179,7 +118,6 @@ async def _post_turn_updates(
     bot_text: str,
     message_count: int,
 ) -> None:
-
     results = await asyncio.gather(
         summarize_exchange_in_background(
             session_id=session.session_id,
@@ -196,14 +134,10 @@ async def _post_turn_updates(
     )
 
     for result in results:
-        if isinstance(
-            result,
-            Exception,
-        ):
+        if isinstance(result, Exception):
             logger.warning(
                 f"[{session.session_id}] "
-                f"Background memory update failed: "
-                f"{result}"
+                f"Background memory update failed: {result}"
             )
 
 
@@ -212,25 +146,16 @@ async def _process_turn(
     websocket: WebSocket,
     user_text: str,
 ) -> None:
+    user_text = " ".join(user_text.split()).strip()
 
-    user_text = " ".join(
-        user_text.split()
-    ).strip()
-
-    if not _valid_transcript(
-        user_text
-    ):
+    if not _valid_transcript(user_text):
         logger.info(
             f"[{session.session_id}] "
-            f"Transcript ignored: "
-            f"'{user_text}'"
+            f"Transcript ignored: '{user_text}'"
         )
         return
 
-    if (
-        session.state_machine.state
-        != CallState.LISTENING
-    ):
+    if session.state_machine.state != CallState.LISTENING:
         logger.info(
             f"[{session.session_id}] "
             "Ignoring transcript while agent is busy"
@@ -238,32 +163,42 @@ async def _process_turn(
         return
 
     session.interrupted = False
+    session.state_machine.transition(CallState.THINKING)
 
-    session.state_machine.transition(
-        CallState.THINKING
-    )
+    turn_started = time.perf_counter()
+    tts_connect_task = None
+    tts_ws = None
+    audio_started = False
+    first_audio_sent = False
 
     try:
+        # Connect ElevenLabs while memory + RAG run.
+        tts_connect_task = asyncio.create_task(
+            voice_manager.connect_stream()
+        )
 
-        await websocket.send_json({
-            "type": "transcript",
-            "text": user_text,
-        })
-
-        (
-            message_count,
-            retrieved_context,
-        ) = await asyncio.gather(
-
-            memory_manager
-            .increment_message_count(
+        message_count_task = asyncio.create_task(
+            memory_manager.increment_message_count(
                 session.session_id
-            ),
+            )
+        )
 
+        rag_task = asyncio.create_task(
             asyncio.to_thread(
                 retriever.retrieve,
                 user_text,
-            ),
+            )
+        )
+
+        message_count, retrieved_context = await asyncio.gather(
+            message_count_task,
+            rag_task,
+        )
+
+        logger.info(
+            f"[{session.session_id}] "
+            f"Memory + RAG ready in "
+            f"{time.perf_counter() - turn_started:.2f}s"
         )
 
         contents = await build_gemini_context(
@@ -273,159 +208,10 @@ async def _process_turn(
             message_count=message_count,
         )
 
-        bot_parts = []
-
-        async def gemini_text_stream():
-
-            async for chunk in (
-                gemini_service
-                .generate_reply_stream_from_contents(
-                    contents
-                )
-            ):
-
-                if not chunk:
-                    continue
-
-                bot_parts.append(chunk)
-
-                yield chunk
-
-        session.state_machine.transition(
-            CallState.SPEAKING
-        )
-
-        audio_started = False
-
         try:
-
-            await websocket.send_json({
-                "type": "audio_start",
-            })
-
-            audio_started = True
-
-            async for packet in (
-                voice_manager.stream(
-                    gemini_text_stream()
-                )
-            ):
-
-                if session.interrupted:
-
-                    logger.info(
-                        f"[{session.session_id}] "
-                        "Reply interrupted"
-                    )
-
-                    break
-
-                audio = b""
-                alignment = None
-
-                if isinstance(
-                    packet,
-                    (
-                        bytes,
-                        bytearray,
-                        memoryview,
-                    ),
-                ):
-
-                    audio = bytes(packet)
-
-                elif isinstance(
-                    packet,
-                    dict,
-                ):
-
-                    raw_audio = packet.get(
-                        "audio",
-                        b"",
-                    )
-
-                    if isinstance(
-                        raw_audio,
-                        (
-                            bytes,
-                            bytearray,
-                            memoryview,
-                        ),
-                    ):
-                        audio = bytes(
-                            raw_audio
-                        )
-
-                    raw_alignment = (
-                        packet.get(
-                            "alignment"
-                        )
-                        or packet.get(
-                            "normalized_alignment"
-                        )
-                        or packet.get(
-                            "normalizedAlignment"
-                        )
-                    )
-
-                    alignment = (
-                        _plain_alignment(
-                            raw_alignment
-                        )
-                    )
-
-                else:
-
-                    logger.warning(
-                        f"[{session.session_id}] "
-                        "Unsupported ElevenLabs "
-                        f"packet type: "
-                        f"{type(packet).__name__}"
-                    )
-
-                if alignment:
-
-                    await websocket.send_json({
-                        "type": "audio_alignment",
-                        "alignment": alignment,
-                    })
-
-                if audio:
-
-                    await websocket.send_bytes(
-                        audio
-                    )
-
-        except AllGeminiKeysExhausted:
-
-            logger.error(
-                f"[{session.session_id}] "
-                "All Gemini API keys exhausted"
-            )
-
-            await _send_error(
-                websocket,
-                "AI service is temporarily unavailable.",
-            )
-
-            return
-
-        except GeminiApiError as exc:
-
-            logger.error(
-                f"[{session.session_id}] "
-                f"Gemini API error: {exc}"
-            )
-
-            await _send_error(
-                websocket,
-                "AI response generation failed.",
-            )
-
-            return
+            tts_ws = await tts_connect_task
 
         except AllElevenLabsKeysExhausted:
-
             logger.error(
                 f"[{session.session_id}] "
                 "All ElevenLabs accounts exhausted"
@@ -435,11 +221,124 @@ async def _process_turn(
                 websocket,
                 "Voice generation is temporarily unavailable.",
             )
+            return
 
+        bot_parts = []
+
+        async def gemini_text_stream():
+            async for chunk in gemini_service.generate_reply_stream_from_contents(
+                contents
+            ):
+                if chunk:
+                    bot_parts.append(chunk)
+                    yield chunk
+
+        session.state_machine.transition(CallState.SPEAKING)
+
+        try:
+            await websocket.send_json({
+                "type": "audio_start",
+            })
+
+            audio_started = True
+
+            async for packet in voice_manager.stream(
+                gemini_text_stream(),
+                ws=tts_ws,
+            ):
+                if session.interrupted:
+                    logger.info(
+                        f"[{session.session_id}] Reply interrupted"
+                    )
+                    break
+
+                audio = b""
+                alignment = None
+
+                if isinstance(packet, (bytes, bytearray, memoryview)):
+                    audio = bytes(packet)
+
+                elif isinstance(packet, dict):
+                    raw_audio = packet.get("audio", b"")
+
+                    if isinstance(
+                        raw_audio,
+                        (bytes, bytearray, memoryview),
+                    ):
+                        audio = bytes(raw_audio)
+
+                    raw_alignment = (
+                        packet.get("alignment")
+                        or packet.get("normalized_alignment")
+                        or packet.get("normalizedAlignment")
+                    )
+
+                    alignment = _plain_alignment(
+                        raw_alignment
+                    )
+
+                else:
+                    logger.warning(
+                        f"[{session.session_id}] "
+                        f"Unsupported ElevenLabs packet: "
+                        f"{type(packet).__name__}"
+                    )
+
+                if alignment:
+                    await websocket.send_json({
+                        "type": "audio_alignment",
+                        "alignment": alignment,
+                    })
+
+                if audio:
+                    if not first_audio_sent:
+                        first_audio_sent = True
+
+                        logger.info(
+                            f"[{session.session_id}] "
+                            f"FIRST AUDIO in "
+                            f"{time.perf_counter() - turn_started:.2f}s ✅"
+                        )
+
+                    await websocket.send_bytes(audio)
+
+        except AllGeminiKeysExhausted:
+            logger.error(
+                f"[{session.session_id}] "
+                "All Gemini API keys exhausted"
+            )
+
+            await _send_error(
+                websocket,
+                "AI service is temporarily unavailable.",
+            )
+            return
+
+        except GeminiApiError as exc:
+            logger.error(
+                f"[{session.session_id}] "
+                f"Gemini API error: {exc}"
+            )
+
+            await _send_error(
+                websocket,
+                "AI response generation failed.",
+            )
+            return
+
+        except AllElevenLabsKeysExhausted:
+            logger.error(
+                f"[{session.session_id}] "
+                "All ElevenLabs accounts exhausted"
+            )
+
+            await _send_error(
+                websocket,
+                "Voice generation is temporarily unavailable.",
+            )
             return
 
         except ApiError as exc:
-
             logger.error(
                 f"[{session.session_id}] "
                 f"ElevenLabs error: {exc}"
@@ -449,46 +348,35 @@ async def _process_turn(
                 websocket,
                 "Voice generation failed.",
             )
-
             return
 
         except Exception as exc:
-
             logger.exception(
                 f"[{session.session_id}] "
-                f"Streaming response failed: "
-                f"{exc}"
+                f"Streaming response failed: {exc}"
             )
 
             await _send_error(
                 websocket,
                 "Voice response failed.",
             )
-
             return
 
         finally:
-
             if audio_started:
-
                 try:
-
                     await websocket.send_json({
                         "type": "audio_end",
                     })
-
                 except Exception:
                     pass
 
         if session.interrupted:
             return
 
-        bot_text = "".join(
-            bot_parts
-        ).strip()
+        bot_text = "".join(bot_parts).strip()
 
         if not bot_text:
-
             logger.warning(
                 f"[{session.session_id}] "
                 "Gemini returned empty response"
@@ -498,7 +386,6 @@ async def _process_turn(
                 websocket,
                 "The agent could not generate a response.",
             )
-
             return
 
         session.conversation_history.extend([
@@ -512,9 +399,7 @@ async def _process_turn(
             },
         ])
 
-        session.message_count = (
-            message_count + 1
-        )
+        session.message_count = message_count + 1
 
         session.last_messages = {
             "user": user_text,
@@ -534,11 +419,9 @@ async def _process_turn(
         raise
 
     except Exception as exc:
-
         logger.exception(
             f"[{session.session_id}] "
-            f"Turn processing failed: "
-            f"{exc}"
+            f"Turn processing failed: {exc}"
         )
 
         await _send_error(
@@ -547,13 +430,103 @@ async def _process_turn(
         )
 
     finally:
+        if tts_connect_task:
+            if not tts_connect_task.done():
+                tts_connect_task.cancel()
 
-        if (
-            session.state_machine.state
-            != CallState.LISTENING
-        ):
+            await asyncio.gather(
+                tts_connect_task,
+                return_exceptions=True,
+            )
 
+        if tts_ws and not getattr(tts_ws, "closed", True):
+            try:
+                await tts_ws.close()
+            except Exception:
+                pass
+
+        if session.state_machine.state != CallState.LISTENING:
             session.state_machine.interrupt()
+
+
+async def _consume_deepgram_events(
+    session: Session,
+    websocket: WebSocket,
+    deepgram_session,
+) -> None:
+    """
+    Streams Deepgram interim transcripts directly to the browser.
+
+    Example:
+        You: Hello
+        You: Hello I want
+        You: Hello I want to know
+        You: Hello I want to know more about Vishal
+    """
+
+    try:
+        while True:
+            event = await deepgram_session.next_event()
+
+            if not event:
+                continue
+
+            if event.type == "speech_started":
+                await websocket.send_json({
+                    "type": "user_speech_start",
+                })
+                continue
+
+            if event.type == "transcript":
+                text = " ".join(
+                    event.text.split()
+                ).strip()
+
+                if not text:
+                    continue
+
+                await websocket.send_json({
+                    "type": "user_transcript",
+                    "text": text,
+                    "is_final": bool(event.is_final),
+                    "speech_final": bool(event.speech_final),
+                })
+
+                continue
+
+            if event.type == "utterance":
+                text = " ".join(
+                    event.text.split()
+                ).strip()
+
+                if text:
+                    await websocket.send_json({
+                        "type": "user_transcript_end",
+                        "text": text,
+                    })
+
+                continue
+
+            if event.type == "connection_closed":
+                logger.warning(
+                    f"[{session.session_id}] "
+                    "Deepgram event stream closed"
+                )
+
+            elif event.type == "error":
+                logger.warning(
+                    f"[{session.session_id}] "
+                    f"Deepgram event error: {event.text}"
+                )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        logger.error(
+            f"[{session.session_id}] "
+            f"Deepgram live transcript consumer error: {exc}"
+        )
 
 
 async def _consume_deepgram_utterances(
@@ -561,182 +534,127 @@ async def _consume_deepgram_utterances(
     websocket: WebSocket,
     deepgram_session,
 ) -> None:
-
     try:
-
         while True:
+            user_text = await deepgram_session.next_utterance()
 
-            user_text = await (
-                deepgram_session
-                .next_utterance()
-            )
-
-            if not user_text:
-                continue
-
-            await _process_turn(
-                session=session,
-                websocket=websocket,
-                user_text=user_text,
-            )
+            if user_text:
+                await _process_turn(
+                    session=session,
+                    websocket=websocket,
+                    user_text=user_text,
+                )
 
     except asyncio.CancelledError:
         raise
 
     except Exception as exc:
-
         logger.error(
             f"[{session.session_id}] "
-            f"Deepgram consumer error: "
-            f"{exc}"
+            f"Deepgram consumer error: {exc}"
         )
 
 
 @router.websocket("/ws/call")
-async def call_websocket(
-    websocket: WebSocket,
-) -> None:
-
+async def call_websocket(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    session = (
-        session_manager
-        .create_session()
-    )
+    session = session_manager.create_session()
 
     deepgram_session = None
     utterance_task = None
-    memory_task = None
-    deepgram_task = None
+    event_task = None
+
+    memory_task = asyncio.create_task(
+        memory_manager.create_session(
+            session.session_id
+        )
+    )
+
+    deepgram_task = asyncio.create_task(
+        deepgram_stt.create_session(
+            session.session_id
+        )
+    )
 
     try:
-
-        memory_task = (
-            asyncio.create_task(
-                memory_manager
-                .create_session(
-                    session.session_id
-                )
-            )
-        )
-
-        deepgram_task = (
-            asyncio.create_task(
-                deepgram_stt
-                .create_session(
-                    session.session_id
-                )
-            )
-        )
-
         await websocket.send_json({
             "type": "session_started",
-            "session_id": (
-                session.session_id
-            ),
+            "session_id": session.session_id,
         })
 
         await websocket.send_json({
             "type": "play_greeting",
         })
 
-        (
-            memory_result,
-            deepgram_result,
-        ) = await asyncio.gather(
+        memory_result, deepgram_result = await asyncio.gather(
             memory_task,
             deepgram_task,
             return_exceptions=True,
         )
 
-        if isinstance(
-            memory_result,
-            Exception,
-        ):
+        if isinstance(memory_result, Exception):
             raise memory_result
 
-        if isinstance(
-            deepgram_result,
-            Exception,
-        ):
+        if isinstance(deepgram_result, Exception):
             raise deepgram_result
 
-        deepgram_session = (
-            deepgram_result
-        )
+        deepgram_session = deepgram_result
 
         logger.info(
             f"[{session.session_id}] "
-            "Voice pipeline ready ✅ "
+            f"Voice pipeline ready ✅ "
             f"(Deepgram key "
             f"{deepgram_session.active_key_number})"
         )
 
-        utterance_task = (
-            asyncio.create_task(
-                _consume_deepgram_utterances(
-                    session=session,
-                    websocket=websocket,
-                    deepgram_session=deepgram_session,
-                ),
-                name=(
-                    "deepgram-consumer-"
-                    f"{session.session_id}"
-                ),
-            )
+        # Final utterances trigger the AI response.
+        utterance_task = asyncio.create_task(
+            _consume_deepgram_utterances(
+                session=session,
+                websocket=websocket,
+                deepgram_session=deepgram_session,
+            ),
+            name=f"deepgram-consumer-{session.session_id}",
+        )
+
+        # Interim transcripts are streamed live to the browser.
+        event_task = asyncio.create_task(
+            _consume_deepgram_events(
+                session=session,
+                websocket=websocket,
+                deepgram_session=deepgram_session,
+            ),
+            name=f"deepgram-events-{session.session_id}",
         )
 
         while True:
+            message = await websocket.receive()
 
-            message = (
-                await websocket.receive()
-            )
-
-            if (
-                message["type"]
-                == "websocket.disconnect"
-            ):
-
+            if message["type"] == "websocket.disconnect":
                 raise WebSocketDisconnect(
-                    code=message.get(
-                        "code",
-                        1000,
-                    )
+                    code=message.get("code", 1000)
                 )
 
-            pcm_bytes = message.get(
-                "bytes"
-            )
+            pcm_bytes = message.get("bytes")
 
             if pcm_bytes is not None:
-
-                if (
-                    session.state_machine.state
-                    == CallState.LISTENING
-                ):
-
-                    await (
-                        deepgram_session
-                        .send_audio(
-                            pcm_bytes
-                        )
+                if session.state_machine.state == CallState.LISTENING:
+                    await deepgram_session.send_audio(
+                        pcm_bytes
                     )
 
                 continue
 
-            control = message.get(
-                "text"
-            )
+            control = message.get("text")
 
             if control is not None:
-
                 logger.debug(
                     f"[{session.session_id}] "
                     f"Control: {control}"
                 )
 
     except WebSocketDisconnect:
-
         logger.info(
             f"[{session.session_id}] "
             "Client disconnected"
@@ -746,11 +664,9 @@ async def call_websocket(
         raise
 
     except Exception as exc:
-
         logger.exception(
             f"[{session.session_id}] "
-            f"WebSocket error: "
-            f"{exc}"
+            f"WebSocket error: {exc}"
         )
 
         await _send_error(
@@ -759,28 +675,26 @@ async def call_websocket(
         )
 
     finally:
-
-        if utterance_task:
-
-            utterance_task.cancel()
-
-            await asyncio.gather(
+        consumer_tasks = [
+            task
+            for task in (
                 utterance_task,
+                event_task,
+            )
+            if task
+        ]
+
+        for task in consumer_tasks:
+            if not task.done():
+                task.cancel()
+
+        if consumer_tasks:
+            await asyncio.gather(
+                *consumer_tasks,
                 return_exceptions=True,
             )
 
-        for task in (
-            memory_task,
-            deepgram_task,
-        ):
-
-            if (
-                task
-                and not task.done()
-            ):
-                task.cancel()
-
-        pending_tasks = [
+        startup_tasks = [
             task
             for task in (
                 memory_task,
@@ -789,28 +703,24 @@ async def call_websocket(
             if task
         ]
 
-        if pending_tasks:
+        for task in startup_tasks:
+            if not task.done():
+                task.cancel()
 
+        if startup_tasks:
             await asyncio.gather(
-                *pending_tasks,
+                *startup_tasks,
                 return_exceptions=True,
             )
 
         if deepgram_session:
-
             try:
-
-                await (
-                    deepgram_session
-                    .close()
-                )
+                await deepgram_session.close()
 
             except Exception as exc:
-
                 logger.warning(
                     f"[{session.session_id}] "
-                    "Deepgram cleanup failed: "
-                    f"{exc}"
+                    f"Deepgram cleanup failed: {exc}"
                 )
 
         session_manager.end_session(

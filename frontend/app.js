@@ -32,6 +32,7 @@ let streamEnded = false;
 let streamProtocolActive = false;
 let fallbackChunks = [];
 
+// Agent live captions
 let captionChars = [];
 let captionStarts = [];
 let captionDurations = [];
@@ -41,15 +42,21 @@ let captionLine = null;
 let captionFrame = null;
 let captionAudio = null;
 
+// User live captions
+let userTranscriptLine = null;
+let userTranscriptActive = false;
+let userTranscriptText = "";
+
 
 function log(text, cls = "system") {
   const line = document.createElement("div");
-
   line.className = `log-line ${cls}`;
   line.textContent = text;
 
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
+
+  return line;
 }
 
 
@@ -57,10 +64,7 @@ function floatTo16BitPCM(input) {
   const output = new Int16Array(input.length);
 
   for (let i = 0; i < input.length; i++) {
-    const sample = Math.max(
-      -1,
-      Math.min(1, input[i])
-    );
+    const sample = Math.max(-1, Math.min(1, input[i]));
 
     output[i] =
       sample < 0
@@ -72,38 +76,18 @@ function floatTo16BitPCM(input) {
 }
 
 
-function resampleAudio(
-  input,
-  inputRate,
-  outputRate
-) {
-  if (inputRate === outputRate) {
-    return input.slice();
-  }
+function resampleAudio(input, inputRate, outputRate) {
+  if (inputRate === outputRate) return input.slice();
 
-  const ratio =
-    inputRate / outputRate;
-
-  const length =
-    Math.round(input.length / ratio);
-
-  const output =
-    new Float32Array(length);
+  const ratio = inputRate / outputRate;
+  const length = Math.round(input.length / ratio);
+  const output = new Float32Array(length);
 
   for (let i = 0; i < length; i++) {
     const position = i * ratio;
-
-    const index =
-      Math.floor(position);
-
-    const next =
-      Math.min(
-        index + 1,
-        input.length - 1
-      );
-
-    const fraction =
-      position - index;
+    const index = Math.floor(position);
+    const next = Math.min(index + 1, input.length - 1);
+    const fraction = position - index;
 
     output[i] =
       input[index] * (1 - fraction) +
@@ -128,13 +112,81 @@ function setListening() {
 }
 
 
-function setAgentBusy(
-  text = "Agent responding..."
-) {
+function setAgentBusy(text = "Agent responding...") {
   canSendMic = false;
   statusEl.textContent = text;
 }
 
+
+// --------------------------------------------------
+// USER LIVE TRANSCRIPT
+// --------------------------------------------------
+
+function resetUserTranscript() {
+  userTranscriptLine = null;
+  userTranscriptActive = false;
+  userTranscriptText = "";
+}
+
+
+function startUserTranscript() {
+  if (userTranscriptActive) return;
+
+  userTranscriptActive = true;
+  userTranscriptText = "";
+  userTranscriptLine = null;
+}
+
+
+function ensureUserTranscriptLine() {
+  if (userTranscriptLine) return userTranscriptLine;
+
+  userTranscriptLine = document.createElement("div");
+  userTranscriptLine.className = "log-line user";
+  userTranscriptLine.textContent = "You: ";
+
+  logEl.appendChild(userTranscriptLine);
+  logEl.scrollTop = logEl.scrollHeight;
+
+  return userTranscriptLine;
+}
+
+
+function updateUserTranscript(text) {
+  text = String(text || "").trim();
+  if (!text) return;
+
+  if (!userTranscriptActive) startUserTranscript();
+
+  // Ignore identical Deepgram interim results.
+  if (text === userTranscriptText) return;
+
+  userTranscriptText = text;
+
+  const line = ensureUserTranscriptLine();
+  line.textContent = `You: ${text}`;
+
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+
+function finishUserTranscript(text = "") {
+  text = String(text || "").trim();
+
+  if (text) updateUserTranscript(text);
+
+  userTranscriptActive = false;
+  userTranscriptText = "";
+
+  // Keep the finished DOM line visible,
+  // but next utterance gets a fresh line.
+  userTranscriptLine = null;
+}
+
+
+// --------------------------------------------------
+// AGENT LIVE CAPTIONS
+// --------------------------------------------------
 
 function stopCaptionSync() {
   if (captionFrame !== null) {
@@ -152,7 +204,6 @@ function resetCaptionForReply() {
   captionChars = [];
   captionStarts = [];
   captionDurations = [];
-
   captionLastEndMs = 0;
   captionShown = 0;
   captionLine = null;
@@ -160,18 +211,11 @@ function resetCaptionForReply() {
 
 
 function ensureCaptionLine() {
-  if (captionLine) {
-    return captionLine;
-  }
+  if (captionLine) return captionLine;
 
-  captionLine =
-    document.createElement("div");
-
-  captionLine.className =
-    "log-line agent";
-
-  captionLine.textContent =
-    "Agent: ";
+  captionLine = document.createElement("div");
+  captionLine.className = "log-line agent";
+  captionLine.textContent = "Agent: ";
 
   logEl.appendChild(captionLine);
   logEl.scrollTop = logEl.scrollHeight;
@@ -181,81 +225,56 @@ function ensureCaptionLine() {
 
 
 function addAlignment(alignment) {
-  if (!alignment) {
-    return;
-  }
+  if (!alignment) return;
 
-  const chars =
-    alignment.chars || [];
-
-  const starts =
-    alignment.char_start_times_ms || [];
+  const chars = alignment.chars || [];
+  const starts = alignment.char_start_times_ms || [];
 
   const durations =
     alignment.char_durations_ms ||
     alignment.chars_durations_ms ||
     [];
 
-  if (
-    !chars.length ||
-    !starts.length
-  ) {
-    return;
-  }
+  if (!chars.length || !starts.length) return;
 
   let offset = 0;
 
   if (captionStarts.length > 0) {
-    const firstStart =
-      Number(starts[0]) || 0;
+    const firstStart = Number(starts[0]) || 0;
 
     if (
       firstStart <
-      Math.max(
-        0,
-        captionLastEndMs - 50
-      )
+      Math.max(0, captionLastEndMs - 50)
     ) {
       offset = captionLastEndMs;
     }
   }
 
-  const count =
-    Math.min(
-      chars.length,
-      starts.length
-    );
+  const count = Math.min(
+    chars.length,
+    starts.length
+  );
 
   for (let i = 0; i < count; i++) {
-    const char =
-      String(chars[i] ?? "");
-
-    const rawStart =
-      Number(starts[i]) || 0;
-
-    const duration =
-      Number(durations[i]) || 0;
-
-    const start =
-      rawStart + offset;
+    const char = String(chars[i] ?? "");
+    const rawStart = Number(starts[i]) || 0;
+    const duration = Number(durations[i]) || 0;
+    const start = rawStart + offset;
 
     captionChars.push(char);
     captionStarts.push(start);
     captionDurations.push(duration);
 
-    captionLastEndMs =
-      Math.max(
-        captionLastEndMs,
-        start + duration
-      );
+    captionLastEndMs = Math.max(
+      captionLastEndMs,
+      start + duration
+    );
   }
 }
 
 
 function updateCaption() {
-  if (!captionAudio) {
-    return;
-  }
+  if (!captionAudio) return;
 
   const currentMs =
     captionAudio.currentTime * 1000;
@@ -268,8 +287,7 @@ function updateCaption() {
   }
 
   if (captionShown > 0) {
-    const line =
-      ensureCaptionLine();
+    const line = ensureCaptionLine();
 
     line.textContent =
       "Agent: " +
@@ -277,8 +295,7 @@ function updateCaption() {
         .slice(0, captionShown)
         .join("");
 
-    logEl.scrollTop =
-      logEl.scrollHeight;
+    logEl.scrollTop = logEl.scrollHeight;
   }
 
   if (
@@ -287,9 +304,7 @@ function updateCaption() {
     isCallActive
   ) {
     captionFrame =
-      requestAnimationFrame(
-        updateCaption
-      );
+      requestAnimationFrame(updateCaption);
   }
 }
 
@@ -298,40 +313,34 @@ function startCaptionSync(audio) {
   stopCaptionSync();
 
   captionAudio = audio;
-
   captionFrame =
-    requestAnimationFrame(
-      updateCaption
-    );
+    requestAnimationFrame(updateCaption);
 }
 
 
 function finishCaptionSync() {
   stopCaptionSync();
 
-  if (!captionChars.length) {
-    return;
-  }
+  if (!captionChars.length) return;
 
-  captionShown =
-    captionChars.length;
+  captionShown = captionChars.length;
 
-  const line =
-    ensureCaptionLine();
+  const line = ensureCaptionLine();
 
   line.textContent =
     "Agent: " +
     captionChars.join("");
 
-  logEl.scrollTop =
-    logEl.scrollHeight;
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
 
+// --------------------------------------------------
+// AUDIO CLEANUP
+// --------------------------------------------------
+
 function stopGreeting() {
-  if (!greetingAudio) {
-    return;
-  }
+  if (!greetingAudio) return;
 
   greetingAudio.onended = null;
   greetingAudio.onerror = null;
@@ -361,10 +370,7 @@ function stopLegacyAudio() {
   }
 
   if (legacyAudioUrl) {
-    URL.revokeObjectURL(
-      legacyAudioUrl
-    );
-
+    URL.revokeObjectURL(legacyAudioUrl);
     legacyAudioUrl = null;
   }
 }
@@ -373,11 +379,10 @@ function stopLegacyAudio() {
 function cleanupStreamAudio() {
   if (streamSourceBuffer) {
     try {
-      streamSourceBuffer
-        .removeEventListener(
-          "updateend",
-          pumpStream
-        );
+      streamSourceBuffer.removeEventListener(
+        "updateend",
+        pumpStream
+      );
     } catch (_) {}
   }
 
@@ -388,9 +393,7 @@ function cleanupStreamAudio() {
 
     try {
       streamAudio.pause();
-      streamAudio.removeAttribute(
-        "src"
-      );
+      streamAudio.removeAttribute("src");
       streamAudio.load();
     } catch (_) {}
 
@@ -398,10 +401,7 @@ function cleanupStreamAudio() {
   }
 
   if (streamObjectUrl) {
-    URL.revokeObjectURL(
-      streamObjectUrl
-    );
-
+    URL.revokeObjectURL(streamObjectUrl);
     streamObjectUrl = null;
   }
 
@@ -416,45 +416,36 @@ function cleanupStreamAudio() {
 }
 
 
-function stopAllAgentAudio(
-  resumeListening = false
-) {
+function stopAllAgentAudio(resumeListening = false) {
   stopCaptionSync();
-
   stopGreeting();
   stopLegacyAudio();
   cleanupStreamAudio();
 
-  if (resumeListening) {
-    setListening();
-  }
+  if (resumeListening) setListening();
 }
 
 
 function supportsStreamingAudio() {
   return (
     "MediaSource" in window &&
-    MediaSource.isTypeSupported(
-      STREAM_MIME
-    )
+    MediaSource.isTypeSupported(STREAM_MIME)
   );
 }
 
 
-function playLegacyAudio(
-  arrayBuffer
-) {
+// --------------------------------------------------
+// LEGACY AUDIO
+// --------------------------------------------------
+
+function playLegacyAudio(arrayBuffer) {
   stopLegacyAudio();
+  setAgentBusy("Agent speaking...");
 
-  setAgentBusy(
-    "Agent speaking..."
+  const blob = new Blob(
+    [arrayBuffer],
+    { type: STREAM_MIME }
   );
-
-  const blob =
-    new Blob(
-      [arrayBuffer],
-      { type: STREAM_MIME }
-    );
 
   legacyAudioUrl =
     URL.createObjectURL(blob);
@@ -465,14 +456,11 @@ function playLegacyAudio(
   legacyAudio.preload = "auto";
 
   legacyAudio.onplaying = () => {
-    startCaptionSync(
-      legacyAudio
-    );
+    startCaptionSync(legacyAudio);
   };
 
   legacyAudio.onended = () => {
     finishCaptionSync();
-
     stopLegacyAudio();
     setListening();
   };
@@ -489,21 +477,23 @@ function playLegacyAudio(
     setListening();
   };
 
-  legacyAudio
-    .play()
-    .catch((err) => {
-      stopCaptionSync();
+  legacyAudio.play().catch((err) => {
+    stopCaptionSync();
 
-      log(
-        `Playback error: ${err.message}`,
-        "system"
-      );
+    log(
+      `Playback error: ${err.message}`,
+      "system"
+    );
 
-      stopLegacyAudio();
-      setListening();
-    });
+    stopLegacyAudio();
+    setListening();
+  });
 }
 
+
+// --------------------------------------------------
+// STREAMING AUDIO
+// --------------------------------------------------
 
 function pumpStream() {
   if (
@@ -514,12 +504,10 @@ function pumpStream() {
   }
 
   if (streamChunks.length > 0) {
-    const chunk =
-      streamChunks.shift();
+    const chunk = streamChunks.shift();
 
     try {
-      streamSourceBuffer
-        .appendBuffer(chunk);
+      streamSourceBuffer.appendBuffer(chunk);
     } catch (err) {
       log(
         `Streaming audio error: ${err.message}`,
@@ -533,12 +521,10 @@ function pumpStream() {
   if (
     streamEnded &&
     streamMediaSource &&
-    streamMediaSource.readyState ===
-      "open"
+    streamMediaSource.readyState === "open"
   ) {
     try {
-      streamMediaSource
-        .endOfStream();
+      streamMediaSource.endOfStream();
     } catch (_) {}
   }
 }
@@ -549,9 +535,7 @@ function startAudioStream() {
   cleanupStreamAudio();
   resetCaptionForReply();
 
-  setAgentBusy(
-    "Agent speaking..."
-  );
+  setAgentBusy("Agent speaking...");
 
   streamProtocolActive = true;
   streamEnded = false;
@@ -565,31 +549,20 @@ function startAudioStream() {
     return;
   }
 
-  const mediaSource =
-    new MediaSource();
+  const mediaSource = new MediaSource();
 
-  streamMediaSource =
-    mediaSource;
+  streamMediaSource = mediaSource;
 
   streamObjectUrl =
-    URL.createObjectURL(
-      mediaSource
-    );
+    URL.createObjectURL(mediaSource);
 
-  streamAudio =
-    new Audio();
-
-  streamAudio.src =
-    streamObjectUrl;
-
-  streamAudio.preload =
-    "auto";
+  streamAudio = new Audio();
+  streamAudio.src = streamObjectUrl;
+  streamAudio.preload = "auto";
 
   streamAudio.onplaying = () => {
     if (streamAudio) {
-      startCaptionSync(
-        streamAudio
-      );
+      startCaptionSync(streamAudio);
     }
   };
 
@@ -615,10 +588,8 @@ function startAudioStream() {
     "sourceopen",
     () => {
       if (
-        streamMediaSource !==
-          mediaSource ||
-        mediaSource.readyState !==
-          "open"
+        streamMediaSource !== mediaSource ||
+        mediaSource.readyState !== "open"
       ) {
         return;
       }
@@ -632,22 +603,19 @@ function startAudioStream() {
         streamSourceBuffer.mode =
           "sequence";
 
-        streamSourceBuffer
-          .addEventListener(
-            "updateend",
-            pumpStream
-          );
+        streamSourceBuffer.addEventListener(
+          "updateend",
+          pumpStream
+        );
 
         pumpStream();
 
-        streamAudio
-          ?.play()
-          .catch((err) => {
-            log(
-              `Playback error: ${err.message}`,
-              "system"
-            );
-          });
+        streamAudio?.play().catch((err) => {
+          log(
+            `Playback error: ${err.message}`,
+            "system"
+          );
+        });
 
       } catch (err) {
         log(
@@ -659,41 +627,26 @@ function startAudioStream() {
     { once: true }
   );
 
-  streamAudio
-    .play()
-    .catch(() => {});
+  streamAudio.play().catch(() => {});
 }
 
 
-function appendStreamAudio(
-  arrayBuffer
-) {
+function appendStreamAudio(arrayBuffer) {
   if (!streamProtocolActive) {
     resetCaptionForReply();
-
-    playLegacyAudio(
-      arrayBuffer
-    );
-
+    playLegacyAudio(arrayBuffer);
     return;
   }
 
-  setAgentBusy(
-    "Agent speaking..."
-  );
+  setAgentBusy("Agent speaking...");
 
   if (!supportsStreamingAudio()) {
-    fallbackChunks.push(
-      arrayBuffer
-    );
-
+    fallbackChunks.push(arrayBuffer);
     return;
   }
 
   streamChunks.push(
-    new Uint8Array(
-      arrayBuffer
-    )
+    new Uint8Array(arrayBuffer)
   );
 
   pumpStream();
@@ -701,9 +654,7 @@ function appendStreamAudio(
 
 
 function finishAudioStream() {
-  if (!streamProtocolActive) {
-    return;
-  }
+  if (!streamProtocolActive) return;
 
   if (!supportsStreamingAudio()) {
     const chunks =
@@ -718,59 +669,46 @@ function finishAudioStream() {
       return;
     }
 
-    const blob =
-      new Blob(
-        chunks,
-        { type: STREAM_MIME }
-      );
+    const blob = new Blob(
+      chunks,
+      { type: STREAM_MIME }
+    );
 
     legacyAudioUrl =
       URL.createObjectURL(blob);
 
     legacyAudio =
-      new Audio(
-        legacyAudioUrl
+      new Audio(legacyAudioUrl);
+
+    legacyAudio.preload = "auto";
+
+    legacyAudio.onplaying = () => {
+      startCaptionSync(legacyAudio);
+    };
+
+    legacyAudio.onended = () => {
+      finishCaptionSync();
+      stopLegacyAudio();
+      setListening();
+    };
+
+    legacyAudio.onerror = () => {
+      stopCaptionSync();
+      stopLegacyAudio();
+      setListening();
+    };
+
+    legacyAudio.play().catch((err) => {
+      stopCaptionSync();
+
+      log(
+        `Playback error: ${err.message}`,
+        "system"
       );
 
-    legacyAudio.preload =
-      "auto";
-
-    legacyAudio.onplaying =
-      () => {
-        startCaptionSync(
-          legacyAudio
-        );
-      };
-
-    legacyAudio.onended =
-      () => {
-        finishCaptionSync();
-
-        stopLegacyAudio();
-        setListening();
-      };
-
-    legacyAudio.onerror =
-      () => {
-        stopCaptionSync();
-
-        stopLegacyAudio();
-        setListening();
-      };
-
-    legacyAudio
-      .play()
-      .catch((err) => {
-        stopCaptionSync();
-
-        log(
-          `Playback error: ${err.message}`,
-          "system"
-        );
-
-        stopLegacyAudio();
-        setListening();
-      });
+      stopLegacyAudio();
+      setListening();
+    });
 
     return;
   }
@@ -779,6 +717,10 @@ function finishAudioStream() {
   pumpStream();
 }
 
+
+// --------------------------------------------------
+// MICROPHONE
+// --------------------------------------------------
 
 async function prepareAudioContext() {
   const AudioContextClass =
@@ -796,10 +738,7 @@ async function prepareAudioContext() {
       new AudioContextClass();
   }
 
-  if (
-    audioContext.state ===
-    "suspended"
-  ) {
+  if (audioContext.state === "suspended") {
     await audioContext.resume();
   }
 
@@ -811,10 +750,7 @@ async function prepareAudioContext() {
 
 
 async function startMic() {
-  if (
-    !navigator.mediaDevices
-      ?.getUserMedia
-  ) {
+  if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error(
       "Microphone access is not supported."
     );
@@ -824,15 +760,14 @@ async function startMic() {
     "Requesting microphone permission...";
 
   mediaStream =
-    await navigator.mediaDevices
-      .getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1
-        }
-      });
+    await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
 
   const tracks =
     mediaStream.getAudioTracks();
@@ -843,22 +778,18 @@ async function startMic() {
     );
   }
 
-  const track =
-    tracks[0];
-
-  const settings =
+  const track = tracks[0];
+  const micSettings =
     track.getSettings?.() || {};
 
   log(
-    `Microphone: ${
-      track.label || "default"
-    }`,
+    `Microphone: ${track.label || "default"}`,
     "system"
   );
 
-  if (settings.sampleRate) {
+  if (micSettings.sampleRate) {
     log(
-      `Microphone sample rate: ${settings.sampleRate} Hz`,
+      `Microphone sample rate: ${micSettings.sampleRate} Hz`,
       "system"
     );
   }
@@ -870,88 +801,65 @@ async function startMic() {
     await prepareAudioContext();
   }
 
-  if (
-    audioContext.state ===
-    "suspended"
-  ) {
+  if (audioContext.state === "suspended") {
     await audioContext.resume();
   }
 
   sourceNode =
-    audioContext
-      .createMediaStreamSource(
-        mediaStream
-      );
+    audioContext.createMediaStreamSource(
+      mediaStream
+    );
 
   processorNode =
-    audioContext
-      .createScriptProcessor(
-        4096,
-        1,
-        1
-      );
+    audioContext.createScriptProcessor(
+      4096,
+      1,
+      1
+    );
 
   silentGainNode =
     audioContext.createGain();
 
   silentGainNode.gain.value = 0;
 
-  processorNode.onaudioprocess =
-    (event) => {
-      if (
-        !isCallActive ||
-        !canSendMic ||
-        !ws ||
-        ws.readyState !==
-          WebSocket.OPEN
-      ) {
-        return;
-      }
+  processorNode.onaudioprocess = (event) => {
+    if (
+      !isCallActive ||
+      !canSendMic ||
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
 
-      const input =
-        event.inputBuffer
-          .getChannelData(0);
+    const input =
+      event.inputBuffer.getChannelData(0);
 
-      if (!input?.length) {
-        return;
-      }
+    if (!input?.length) return;
 
-      const inputRate =
-        event.inputBuffer
-          .sampleRate ||
-        audioContext.sampleRate;
+    const inputRate =
+      event.inputBuffer.sampleRate ||
+      audioContext.sampleRate;
 
-      const resampled =
-        resampleAudio(
-          input,
-          inputRate,
-          TARGET_SAMPLE_RATE
-        );
+    const resampled = resampleAudio(
+      input,
+      inputRate,
+      TARGET_SAMPLE_RATE
+    );
 
-      const pcm =
-        floatTo16BitPCM(
-          resampled
-        );
+    const pcm =
+      floatTo16BitPCM(resampled);
 
-      if (
-        pcm.length &&
-        ws.readyState ===
-          WebSocket.OPEN
-      ) {
-        ws.send(
-          pcm.buffer
-        );
-      }
-    };
+    if (
+      pcm.length &&
+      ws.readyState === WebSocket.OPEN
+    ) {
+      ws.send(pcm.buffer);
+    }
+  };
 
-  sourceNode.connect(
-    processorNode
-  );
-
-  processorNode.connect(
-    silentGainNode
-  );
-
+  sourceNode.connect(processorNode);
+  processorNode.connect(silentGainNode);
   silentGainNode.connect(
     audioContext.destination
   );
@@ -963,55 +871,50 @@ async function startMic() {
 }
 
 
+// --------------------------------------------------
+// GREETING
+// --------------------------------------------------
+
 function playGreeting() {
   stopAllAgentAudio(false);
 
-  setAgentBusy(
-    "Agent greeting..."
-  );
+  setAgentBusy("Agent greeting...");
 
   greetingAudio =
-    new Audio(
-      "/greeting.mp3"
+    new Audio("/greeting.mp3");
+
+  greetingAudio.preload = "auto";
+
+  greetingAudio.onended = () => {
+    greetingAudio = null;
+
+    log(
+      "Greeting finished — listening",
+      "system"
     );
 
-  greetingAudio.preload =
-    "auto";
+    setListening();
+  };
 
-  greetingAudio.onended =
-    () => {
-      greetingAudio = null;
+  greetingAudio.onerror = () => {
+    log(
+      "Greeting playback failed.",
+      "system"
+    );
 
-      log(
-        "Greeting finished — listening",
-        "system"
-      );
+    greetingAudio = null;
+    setListening();
+  };
 
-      setListening();
-    };
+  greetingAudio.play().catch((err) => {
+    log(
+      `Greeting error: ${err.message}`,
+      "system"
+    );
 
-  greetingAudio.onerror =
-    () => {
-      log(
-        "Greeting playback failed.",
-        "system"
-      );
-
-      greetingAudio = null;
-      setListening();
-    };
-
-  greetingAudio
-    .play()
-    .catch((err) => {
-      log(
-        `Greeting error: ${err.message}`,
-        "system"
-      );
-
-      greetingAudio = null;
-      setListening();
-    });
+    greetingAudio = null;
+    setListening();
+  });
 
   log(
     "Agent: Hi! I'm Vishal's AI assistant. How can I help you today?",
@@ -1020,19 +923,16 @@ function playGreeting() {
 }
 
 
-function handleControlMessage(
-  msg
-) {
+// --------------------------------------------------
+// SERVER MESSAGES
+// --------------------------------------------------
+
+function handleControlMessage(msg) {
   switch (msg.type) {
 
     case "session_started":
       statusEl.textContent =
-        `In call (${
-          msg.session_id.slice(
-            0,
-            8
-          )
-        }...)`;
+        `In call (${msg.session_id.slice(0, 8)}...)`;
 
       log(
         "Call connected",
@@ -1047,12 +947,36 @@ function handleControlMessage(
       break;
 
 
-    case "transcript":
-      log(
-        `You: ${msg.text}`,
-        "user"
-      );
+    // User started speaking.
+    case "user_speech_start":
+      startUserTranscript();
+      statusEl.textContent =
+        "Listening...";
+      break;
 
+
+    // Deepgram interim/final transcript.
+    // Same DOM line is continuously replaced.
+    case "user_transcript":
+      updateUserTranscript(
+        msg.text
+      );
+      break;
+
+
+    // Complete user utterance.
+    case "user_transcript_end":
+      finishUserTranscript(
+        msg.text
+      );
+      break;
+
+
+    // Backward compatibility with old backend.
+    case "transcript":
+      finishUserTranscript(
+        msg.text
+      );
       break;
 
 
@@ -1060,7 +984,6 @@ function handleControlMessage(
       setAgentBusy(
         "Agent responding..."
       );
-
       break;
 
 
@@ -1073,7 +996,6 @@ function handleControlMessage(
       addAlignment(
         msg.alignment
       );
-
       break;
 
 
@@ -1083,10 +1005,7 @@ function handleControlMessage(
 
 
     case "stop_audio":
-      stopAllAgentAudio(
-        true
-      );
-
+      stopAllAgentAudio(true);
       break;
 
 
@@ -1099,10 +1018,7 @@ function handleControlMessage(
         "system"
       );
 
-      stopAllAgentAudio(
-        true
-      );
-
+      stopAllAgentAudio(true);
       break;
 
 
@@ -1121,16 +1037,17 @@ function handleControlMessage(
 }
 
 
+// --------------------------------------------------
+// CALL
+// --------------------------------------------------
+
 async function startCall() {
-  if (
-    isConnecting ||
-    isCallActive
-  ) {
-    return;
-  }
+  if (isConnecting || isCallActive) return;
 
   isConnecting = true;
   canSendMic = false;
+
+  resetUserTranscript();
 
   callBtn.textContent =
     "Connecting...";
@@ -1149,13 +1066,10 @@ async function startCall() {
     isCallActive = true;
 
     ws =
-      new WebSocket(
-        WS_URL
-      );
+      new WebSocket(WS_URL);
 
     ws.binaryType =
       "arraybuffer";
-
 
     ws.onopen = () => {
       isConnecting = false;
@@ -1172,39 +1086,31 @@ async function startCall() {
       );
     };
 
+    ws.onmessage = (event) => {
+      if (!isCallActive) return;
 
-    ws.onmessage =
-      (event) => {
-        if (!isCallActive) {
-          return;
+      if (
+        typeof event.data === "string"
+      ) {
+        try {
+          handleControlMessage(
+            JSON.parse(event.data)
+          );
+
+        } catch (err) {
+          log(
+            `Invalid server message: ${err.message}`,
+            "system"
+          );
         }
 
-        if (
-          typeof event.data ===
-          "string"
-        ) {
-          try {
-            handleControlMessage(
-              JSON.parse(
-                event.data
-              )
-            );
+        return;
+      }
 
-          } catch (err) {
-            log(
-              `Invalid server message: ${err.message}`,
-              "system"
-            );
-          }
-
-          return;
-        }
-
-        appendStreamAudio(
-          event.data
-        );
-      };
-
+      appendStreamAudio(
+        event.data
+      );
+    };
 
     ws.onerror = () => {
       log(
@@ -1212,7 +1118,6 @@ async function startCall() {
         "system"
       );
     };
-
 
     ws.onclose = () => {
       const wasActive =
@@ -1246,9 +1151,7 @@ async function startCall() {
 }
 
 
-function cleanupCall(
-  closeSocket = true
-) {
+function cleanupCall(closeSocket = true) {
   canSendMic = false;
   isCallActive = false;
   isConnecting = false;
@@ -1256,9 +1159,10 @@ function cleanupCall(
   stopCaptionSync();
   stopAllAgentAudio(false);
 
+  resetUserTranscript();
+
   if (processorNode) {
-    processorNode.onaudioprocess =
-      null;
+    processorNode.onaudioprocess = null;
 
     try {
       processorNode.disconnect();
@@ -1286,45 +1190,33 @@ function cleanupCall(
   if (mediaStream) {
     mediaStream
       .getTracks()
-      .forEach(
-        (track) => {
-          try {
-            track.stop();
-          } catch (_) {}
-        }
-      );
+      .forEach((track) => {
+        try {
+          track.stop();
+        } catch (_) {}
+      });
 
     mediaStream = null;
   }
 
   if (audioContext) {
-    const context =
-      audioContext;
-
+    const context = audioContext;
     audioContext = null;
 
-    if (
-      context.state !==
-      "closed"
-    ) {
-      context
-        .close()
-        .catch(() => {});
+    if (context.state !== "closed") {
+      context.close().catch(() => {});
     }
   }
 
   if (ws) {
     const socket = ws;
-
     ws = null;
 
     if (
       closeSocket &&
       (
-        socket.readyState ===
-          WebSocket.OPEN ||
-        socket.readyState ===
-          WebSocket.CONNECTING
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
       )
     ) {
       try {
@@ -1375,6 +1267,9 @@ callBtn.addEventListener(
     }
 
     logEl.innerHTML = "";
+
+    resetUserTranscript();
+    resetCaptionForReply();
 
     await startCall();
   }

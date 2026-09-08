@@ -200,11 +200,15 @@ class ElevenLabsVoiceManager:
 
         await ws.send(json.dumps({"text": ""}))
 
+    async def connect_stream(self):
+        return await self._connect_stream()
+
     async def stream(
         self,
         text_stream: AsyncIterator[str],
+        ws=None,
     ) -> AsyncIterator[dict]:
-        ws = await self._connect_stream()
+        ws = ws or await self._connect_stream()
 
         sender = asyncio.create_task(
             self._send_text_stream(ws, text_stream)

@@ -58,19 +58,37 @@ class DeepgramSTTSession:
         start_key_index: int = 0,
     ):
         if not api_keys:
-            raise DeepgramNotConfiguredError("No Deepgram API keys configured.")
+            raise DeepgramNotConfiguredError(
+                "No Deepgram API keys configured."
+            )
 
         self.session_id = session_id
         self.api_keys = api_keys
 
-        self.model = getattr(settings, "DEEPGRAM_MODEL", DEFAULT_MODEL)
-        self.language = getattr(settings, "DEEPGRAM_LANGUAGE", DEFAULT_LANGUAGE)
-        self.sample_rate = getattr(settings, "AUDIO_SAMPLE_RATE", DEFAULT_SAMPLE_RATE)
+        self.model = getattr(
+            settings,
+            "DEEPGRAM_MODEL",
+            DEFAULT_MODEL,
+        )
+
+        self.language = getattr(
+            settings,
+            "DEEPGRAM_LANGUAGE",
+            DEFAULT_LANGUAGE,
+        )
+
+        self.sample_rate = getattr(
+            settings,
+            "AUDIO_SAMPLE_RATE",
+            DEFAULT_SAMPLE_RATE,
+        )
+
         self.endpointing_ms = getattr(
             settings,
             "DEEPGRAM_ENDPOINTING_MS",
             DEFAULT_ENDPOINTING_MS,
         )
+
         self.utterance_end_ms = max(
             1000,
             getattr(
@@ -96,10 +114,12 @@ class DeepgramSTTSession:
 
         self._final_parts: List[str] = []
         self._last_utterance = ""
+        self._last_live_transcript = ""
 
         self._event_queue: asyncio.Queue[DeepgramEvent] = asyncio.Queue(
             maxsize=MAX_EVENT_QUEUE
         )
+
         self._utterance_queue: asyncio.Queue[str] = asyncio.Queue(
             maxsize=MAX_UTTERANCE_QUEUE
         )
@@ -114,9 +134,11 @@ class DeepgramSTTSession:
 
     @property
     def active_key_number(self) -> Optional[int]:
-        if self._active_key_index is None:
-            return None
-        return self._active_key_index + 1
+        return (
+            self._active_key_index + 1
+            if self._active_key_index is not None
+            else None
+        )
 
     def _build_url(self) -> str:
         params = {
@@ -137,7 +159,9 @@ class DeepgramSTTSession:
 
     async def connect(self) -> None:
         if self._closing:
-            raise DeepgramSTTError("Deepgram session is closed.")
+            raise DeepgramSTTError(
+                "Deepgram session is closed."
+            )
 
         if self.connected:
             return
@@ -148,28 +172,34 @@ class DeepgramSTTSession:
 
             await self._cleanup_transport()
 
-            last_error: Optional[Exception] = None
-            total_keys = len(self.api_keys)
-            start_index = self._key_index
+            last_error = None
+            total = len(self.api_keys)
+            start = self._key_index
 
-            for offset in range(total_keys):
-                key_index = (start_index + offset) % total_keys
-                api_key = self.api_keys[key_index]
+            for offset in range(total):
+                index = (start + offset) % total
+                api_key = self.api_keys[index]
 
                 try:
                     logger.info(
-                        f"[{self.session_id}] Connecting Deepgram "
-                        f"with key {key_index + 1}/{total_keys}"
+                        f"[{self.session_id}] "
+                        f"Connecting Deepgram with key "
+                        f"{index + 1}/{total}"
                     )
 
-                    await self._open_connection(api_key, key_index)
+                    await self._open_connection(
+                        api_key,
+                        index,
+                    )
 
-                    self._key_index = key_index
+                    self._key_index = index
 
                     logger.info(
-                        f"[{self.session_id}] Deepgram connected ✅ "
-                        f"(key {key_index + 1})"
+                        f"[{self.session_id}] "
+                        f"Deepgram connected ✅ "
+                        f"(key {index + 1})"
                     )
+
                     return
 
                 except asyncio.CancelledError:
@@ -179,8 +209,9 @@ class DeepgramSTTSession:
                     last_error = exc
 
                     logger.warning(
-                        f"[{self.session_id}] Deepgram key "
-                        f"{key_index + 1} failed: {self._safe_error(exc)}"
+                        f"[{self.session_id}] "
+                        f"Deepgram key {index + 1} failed: "
+                        f"{self._safe_error(exc)}"
                     )
 
                     await self._cleanup_transport()
@@ -248,7 +279,8 @@ class DeepgramSTTSession:
 
             except (ConnectionClosed, OSError, RuntimeError) as exc:
                 logger.warning(
-                    f"[{self.session_id}] Deepgram send failed: "
+                    f"[{self.session_id}] "
+                    f"Deepgram send failed: "
                     f"{self._safe_error(exc)}"
                 )
 
@@ -256,7 +288,8 @@ class DeepgramSTTSession:
             await self._cleanup_transport()
 
             logger.info(
-                f"[{self.session_id}] Switching Deepgram API key..."
+                f"[{self.session_id}] "
+                "Switching Deepgram API key..."
             )
 
             await self.connect()
@@ -276,12 +309,15 @@ class DeepgramSTTSession:
 
         try:
             await self._ws.send(
-                json.dumps({"type": "Finalize"})
+                json.dumps({
+                    "type": "Finalize"
+                })
             )
+
         except Exception as exc:
             logger.debug(
-                f"[{self.session_id}] Finalize failed: "
-                f"{self._safe_error(exc)}"
+                f"[{self.session_id}] "
+                f"Finalize failed: {self._safe_error(exc)}"
             )
 
     async def next_utterance(
@@ -296,6 +332,7 @@ class DeepgramSTTSession:
                 self._utterance_queue.get(),
                 timeout=timeout,
             )
+
         except asyncio.TimeoutError:
             return ""
 
@@ -311,12 +348,14 @@ class DeepgramSTTSession:
                 self._event_queue.get(),
                 timeout=timeout,
             )
+
         except asyncio.TimeoutError:
             return None
 
     async def events(self) -> AsyncIterator[DeepgramEvent]:
         while not self._closing:
             event = await self.next_event()
+
             if event:
                 yield event
 
@@ -337,7 +376,9 @@ class DeepgramSTTSession:
                 except json.JSONDecodeError:
                     continue
 
-                await self._handle_message(message)
+                await self._handle_message(
+                    message
+                )
 
         except asyncio.CancelledError:
             raise
@@ -345,7 +386,8 @@ class DeepgramSTTSession:
         except ConnectionClosed as exc:
             if not self._closing:
                 logger.warning(
-                    f"[{self.session_id}] Deepgram disconnected "
+                    f"[{self.session_id}] "
+                    f"Deepgram disconnected "
                     f"(code={exc.code}, reason={exc.reason})"
                 )
 
@@ -361,7 +403,8 @@ class DeepgramSTTSession:
         except Exception as exc:
             if not self._closing:
                 logger.error(
-                    f"[{self.session_id}] Deepgram receive error: "
+                    f"[{self.session_id}] "
+                    f"Deepgram receive error: "
                     f"{self._safe_error(exc)}"
                 )
 
@@ -382,10 +425,15 @@ class DeepgramSTTSession:
         self,
         message: Dict[str, Any],
     ) -> None:
-        message_type = message.get("type", "")
+        message_type = message.get(
+            "type",
+            "",
+        )
 
         if message_type == "Results":
-            await self._handle_results(message)
+            await self._handle_results(
+                message
+            )
             return
 
         if message_type == "SpeechStarted":
@@ -426,7 +474,8 @@ class DeepgramSTTSession:
             )
 
             logger.error(
-                f"[{self.session_id}] Deepgram error: {description}"
+                f"[{self.session_id}] "
+                f"Deepgram error: {description}"
             )
 
             await self._put_event(
@@ -454,34 +503,69 @@ class DeepgramSTTSession:
 
         best = alternatives[0]
 
-        transcript = (
-            best.get("transcript") or ""
+        segment = " ".join(
+            (
+                best.get("transcript")
+                or ""
+            ).split()
         ).strip()
 
-        is_final = bool(message.get("is_final"))
-        speech_final = bool(message.get("speech_final"))
-        confidence = float(best.get("confidence") or 0)
+        is_final = bool(
+            message.get("is_final")
+        )
 
-        if transcript:
-            await self._put_event(
-                DeepgramEvent(
-                    type="transcript",
-                    text=transcript,
-                    is_final=is_final,
-                    speech_final=speech_final,
-                    confidence=confidence,
-                    raw=message,
-                )
-            )
+        speech_final = bool(
+            message.get("speech_final")
+        )
 
+        confidence = float(
+            best.get("confidence")
+            or 0
+        )
+
+        if segment:
             if (
                 is_final
                 and (
                     not self._final_parts
-                    or self._final_parts[-1] != transcript
+                    or self._final_parts[-1] != segment
                 )
             ):
-                self._final_parts.append(transcript)
+                self._final_parts.append(
+                    segment
+                )
+
+            if is_final:
+                live_text = self._join_parts(
+                    self._final_parts
+                )
+            else:
+                live_text = self._join_parts(
+                    [
+                        *self._final_parts,
+                        segment,
+                    ]
+                )
+
+            if (
+                live_text
+                and live_text
+                != self._last_live_transcript
+            ):
+                self._last_live_transcript = (
+                    live_text
+                )
+
+                await self._put_event(
+                    DeepgramEvent(
+                        type="transcript",
+                        text=live_text,
+                        is_final=is_final,
+                        speech_final=speech_final,
+                        confidence=confidence,
+                        raw=message,
+                    )
+                )
 
         if speech_final:
             await self._flush_utterance()
@@ -490,22 +574,29 @@ class DeepgramSTTSession:
         if not self._final_parts:
             return
 
-        text = " ".join(
-            " ".join(self._final_parts).split()
-        ).strip()
+        text = self._join_parts(
+            self._final_parts
+        )
 
         self._final_parts.clear()
+        self._last_live_transcript = ""
 
-        if not text or text == self._last_utterance:
+        if (
+            not text
+            or text == self._last_utterance
+        ):
             return
 
         self._last_utterance = text
 
         logger.info(
-            f"[{self.session_id}] Deepgram: '{text}'"
+            f"[{self.session_id}] "
+            f"Deepgram: '{text}'"
         )
 
-        await self._put_utterance(text)
+        await self._put_utterance(
+            text
+        )
 
         await self._put_event(
             DeepgramEvent(
@@ -529,27 +620,37 @@ class DeepgramSTTSession:
                 await asyncio.sleep(1)
 
                 if (
-                    time.monotonic() - self._last_audio_at
+                    time.monotonic()
+                    - self._last_audio_at
                     < KEEPALIVE_INTERVAL
                 ):
                     continue
 
                 await ws.send(
-                    json.dumps({"type": "KeepAlive"})
+                    json.dumps({
+                        "type": "KeepAlive"
+                    })
                 )
 
-                self._last_audio_at = time.monotonic()
+                self._last_audio_at = (
+                    time.monotonic()
+                )
 
         except asyncio.CancelledError:
             raise
 
-        except (ConnectionClosed, OSError, RuntimeError):
+        except (
+            ConnectionClosed,
+            OSError,
+            RuntimeError,
+        ):
             pass
 
         except Exception as exc:
             if not self._closing:
                 logger.debug(
-                    f"[{self.session_id}] KeepAlive stopped: "
+                    f"[{self.session_id}] "
+                    f"KeepAlive stopped: "
                     f"{self._safe_error(exc)}"
                 )
 
@@ -587,13 +688,22 @@ class DeepgramSTTSession:
         except asyncio.QueueFull:
             pass
 
+    @staticmethod
+    def _join_parts(
+        parts: List[str],
+    ) -> str:
+        return " ".join(
+            " ".join(parts).split()
+        ).strip()
+
     def _advance_key(self) -> None:
         if not self.api_keys:
             return
 
         current = (
             self._active_key_index
-            if self._active_key_index is not None
+            if self._active_key_index
+            is not None
             else self._key_index
         )
 
@@ -603,8 +713,12 @@ class DeepgramSTTSession:
 
         self._active_key_index = None
 
-    async def _cleanup_transport(self) -> None:
-        current_task = asyncio.current_task()
+    async def _cleanup_transport(
+        self,
+    ) -> None:
+        current_task = (
+            asyncio.current_task()
+        )
 
         tasks = [
             task
@@ -612,9 +726,11 @@ class DeepgramSTTSession:
                 self._receive_task,
                 self._keepalive_task,
             )
-            if task
-            and task is not current_task
-            and not task.done()
+            if (
+                task
+                and task is not current_task
+                and not task.done()
+            )
         ]
 
         self._receive_task = None
@@ -630,6 +746,7 @@ class DeepgramSTTSession:
             )
 
         ws = self._ws
+
         self._ws = None
         self._connected.clear()
 
@@ -648,21 +765,32 @@ class DeepgramSTTSession:
         if self.connected:
             try:
                 await self._ws.send(
-                    json.dumps({"type": "CloseStream"})
+                    json.dumps({
+                        "type": "CloseStream"
+                    })
                 )
             except Exception:
                 pass
 
         await self._cleanup_transport()
+
         self._final_parts.clear()
+        self._last_live_transcript = ""
 
         logger.info(
-            f"[{self.session_id}] Deepgram session closed"
+            f"[{self.session_id}] "
+            "Deepgram session closed"
         )
 
     @staticmethod
-    def _safe_error(exc: Exception) -> str:
-        status = getattr(exc, "status_code", None)
+    def _safe_error(
+        exc: Exception,
+    ) -> str:
+        status = getattr(
+            exc,
+            "status_code",
+            None,
+        )
 
         if status:
             return (
@@ -671,36 +799,44 @@ class DeepgramSTTSession:
             )
 
         return (
-            f"{exc.__class__.__name__}: {exc}"
+            f"{exc.__class__.__name__}: "
+            f"{exc}"
         )
 
 
 class DeepgramSTT:
     def __init__(self):
         self._next_key_index = 0
-        self._rotation_lock = asyncio.Lock()
+        self._rotation_lock = (
+            asyncio.Lock()
+        )
 
     def _get_api_keys(self) -> List[str]:
         return [
             key.strip()
-            for key in settings.DEEPGRAM_API_KEYS
+            for key
+            in settings.DEEPGRAM_API_KEYS
             if key and key.strip()
         ]
 
     @property
     def configured(self) -> bool:
-        return bool(self._get_api_keys())
+        return bool(
+            self._get_api_keys()
+        )
 
     async def create_session(
         self,
         session_id: str,
     ) -> DeepgramSTTSession:
-        api_keys = self._get_api_keys()
+        api_keys = (
+            self._get_api_keys()
+        )
 
         if not api_keys:
             raise DeepgramNotConfiguredError(
-                "Configure DEEPGRAM_API_KEY1 through "
-                "DEEPGRAM_API_KEY4."
+                "Configure DEEPGRAM_API_KEY1 "
+                "through DEEPGRAM_API_KEY4."
             )
 
         async with self._rotation_lock:
@@ -720,6 +856,7 @@ class DeepgramSTT:
         )
 
         await session.connect()
+
         return session
 
 
