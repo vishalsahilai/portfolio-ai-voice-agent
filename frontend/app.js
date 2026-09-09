@@ -1,4 +1,7 @@
-const WS_URL = "ws://localhost:8001/ws/call";
+const WS_URL =
+  window.location.hostname === "localhost"
+    ? "ws://localhost:8001/ws/call"
+    : "wss://portfolio-ai-voice-agent.onrender.com/ws/call";
 const TARGET_SAMPLE_RATE = 16000;
 const STREAM_MIME = "audio/mpeg";
 
