@@ -26,6 +26,9 @@ let greetingAudio = null;
 let legacyAudio = null;
 let legacyAudioUrl = null;
 
+let bufferedAudioSource = null;
+let bufferedCaptionClock = null;
+
 let streamAudio = null;
 let streamMediaSource = null;
 let streamSourceBuffer = null;
@@ -378,6 +381,24 @@ function stopLegacyAudio() {
   }
 }
 
+function stopBufferedAudio() {
+  if (!bufferedAudioSource) return;
+
+  const source = bufferedAudioSource;
+
+  bufferedAudioSource = null;
+  bufferedCaptionClock = null;
+
+  source.onended = null;
+
+  try {
+    source.stop();
+  } catch (_) {}
+
+  try {
+    source.disconnect();
+  } catch (_) {}
+}
 
 function cleanupStreamAudio() {
   if (streamSourceBuffer) {
@@ -423,6 +444,7 @@ function stopAllAgentAudio(resumeListening = false) {
   stopCaptionSync();
   stopGreeting();
   stopLegacyAudio();
+  stopBufferedAudio();
   cleanupStreamAudio();
 
   if (resumeListening) setListening();
@@ -655,21 +677,23 @@ function appendStreamAudio(arrayBuffer) {
   pumpStream();
 }
 
+async function playBufferedAudio(chunks) {
+  if (!chunks.length) {
+    finishCaptionSync();
+    setListening();
+    return;
+  }
 
-function finishAudioStream() {
-  if (!streamProtocolActive) return;
+  try {
+    if (
+      !audioContext ||
+      audioContext.state === "closed"
+    ) {
+      await prepareAudioContext();
+    }
 
-  if (!supportsStreamingAudio()) {
-    const chunks =
-      fallbackChunks.slice();
-
-    fallbackChunks = [];
-    streamProtocolActive = false;
-
-    if (!chunks.length) {
-      finishCaptionSync();
-      setListening();
-      return;
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
     }
 
     const blob = new Blob(
@@ -677,42 +701,96 @@ function finishAudioStream() {
       { type: STREAM_MIME }
     );
 
-    legacyAudioUrl =
-      URL.createObjectURL(blob);
+    const encodedAudio =
+      await blob.arrayBuffer();
 
-    legacyAudio =
-      new Audio(legacyAudioUrl);
-
-    legacyAudio.preload = "auto";
-
-    legacyAudio.onplaying = () => {
-      startCaptionSync(legacyAudio);
-    };
-
-    legacyAudio.onended = () => {
-      finishCaptionSync();
-      stopLegacyAudio();
-      setListening();
-    };
-
-    legacyAudio.onerror = () => {
-      stopCaptionSync();
-      stopLegacyAudio();
-      setListening();
-    };
-
-    legacyAudio.play().catch((err) => {
-      stopCaptionSync();
-
-      log(
-        `Playback error: ${err.message}`,
-        "system"
+    const decodedAudio =
+      await audioContext.decodeAudioData(
+        encodedAudio.slice(0)
       );
 
-      stopLegacyAudio();
-      setListening();
-    });
+    if (!isCallActive) return;
 
+    stopBufferedAudio();
+
+    const source =
+      audioContext.createBufferSource();
+
+    source.buffer = decodedAudio;
+
+    source.connect(
+      audioContext.destination
+    );
+
+    const startedAt =
+      audioContext.currentTime;
+
+    bufferedAudioSource = source;
+
+    bufferedCaptionClock = {
+      get currentTime() {
+        if (
+          !audioContext ||
+          audioContext.state === "closed"
+        ) {
+          return 0;
+        }
+
+        return Math.max(
+          0,
+          audioContext.currentTime - startedAt
+        );
+      },
+
+      get ended() {
+        return bufferedAudioSource !== source;
+      },
+    };
+
+    source.onended = () => {
+      if (bufferedAudioSource !== source) {
+        return;
+      }
+
+      try {
+        source.disconnect();
+      } catch (_) {}
+
+      bufferedAudioSource = null;
+      bufferedCaptionClock = null;
+
+      finishCaptionSync();
+      setListening();
+    };
+
+    startCaptionSync(
+      bufferedCaptionClock
+    );
+
+    source.start(0);
+
+  } catch (err) {
+    stopCaptionSync();
+    stopBufferedAudio();
+
+    log(
+      `Playback error: ${err.message}`,
+      "system"
+    );
+
+    setListening();
+  }
+}
+
+function finishAudioStream() {
+  if (!supportsStreamingAudio()) {
+    const chunks =
+      fallbackChunks.slice();
+
+    fallbackChunks = [];
+    streamProtocolActive = false;
+
+    playBufferedAudio(chunks);
     return;
   }
 
