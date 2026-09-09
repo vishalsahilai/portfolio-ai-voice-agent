@@ -276,9 +276,7 @@ A recommended project layout is:
 data/
 └── portfolio.pdf          # or your current portfolio/resume knowledge file
 
-scripts/
-└── ingest.py
-```
+
 
 ### Standard update workflow
 
@@ -293,14 +291,14 @@ Run:
 
 ```bash
 source venv/bin/activate
-python scripts/ingest.py
+python -m rag.ingest
 ```
 
 Windows:
 
 ```powershell
 venv\Scripts\activate
-python scripts\ingest.py
+python -m rag.ingest
 ```
 
 ### When replacing an existing document
@@ -662,7 +660,9 @@ portfolio-ai-voice-agent/
 │
 ├── rag/
 │   ├── retriever.py
-│   └── embeddings.py
+│   ├── embeddings.py
+│    ├── ingest.py
+│    └── vector_store.py
 │
 ├── tts/
 │   └── voice_manager.py
@@ -1093,7 +1093,7 @@ pip install -r requirements.txt
 cp .env.example .env
 
 # Rebuild/update Pinecone knowledge
-python scripts/ingest.py
+python -m rag.ingest
 
 # Run
 python main.py

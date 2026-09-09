@@ -48,7 +48,7 @@ def load_documents() -> List[dict]:
 def run_ingestion() -> None:
     documents = load_documents()
     if not documents:
-        logger.warning(f"No .txt/.md files found in {KNOWLEDGE_BASE_DIR} — nothing to ingest")
+        logger.warning(f"No knowledge documents found in {KNOWLEDGE_BASE_DIR} — nothing to ingest")
         return
  
     all_chunks = []
