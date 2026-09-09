@@ -1,6 +1,8 @@
 from threading import Lock
 from typing import AsyncIterator, List, Optional
 
+import httpx
+
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -12,7 +14,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-GEMINI_TIMEOUT_MS = 15000
+GEMINI_TIMEOUT_MS = 8000
 ROTATE_CODES = {401, 403, 429, 500, 502, 503, 504}
 
 
@@ -58,8 +60,15 @@ class GeminiService:
             self._current_index = index
 
     @staticmethod
-    def _should_rotate(exc: Exception) -> bool:
-        return getattr(exc, "code", None) in ROTATE_CODES
+    def _get_error_code(exc: Exception):
+        return (
+            getattr(exc, "code", None)
+            or getattr(exc, "status_code", None)
+        )
+
+    @classmethod
+    def _should_rotate(cls, exc: Exception) -> bool:
+        return cls._get_error_code(exc) in ROTATE_CODES
 
     @staticmethod
     def _extract_text(response) -> str:
@@ -105,7 +114,9 @@ class GeminiService:
                     config=self._config,
                 )
 
-                text = self._extract_text(response).strip()
+                text = self._extract_text(
+                    response
+                ).strip()
 
                 self._set_current_index(index)
 
@@ -119,12 +130,20 @@ class GeminiService:
                 return text
 
             except APIError as exc:
+                code = self._get_error_code(exc)
+
                 if not self._should_rotate(exc):
                     raise
 
                 logger.warning(
-                    f"Gemini key {index + 1}/{total} failed "
-                    f"({getattr(exc, 'code', 'unknown')}) — rotating"
+                    f"Gemini key {index + 1}/{total} "
+                    f"failed ({code}) — rotating"
+                )
+
+            except httpx.TimeoutException:
+                logger.warning(
+                    f"Gemini key {index + 1}/{total} "
+                    f"timed out — rotating"
                 )
 
             except Exception as exc:
@@ -179,7 +198,9 @@ class GeminiService:
 
                 self._set_current_index(index)
 
-                final_text = "".join(full_response).strip()
+                final_text = "".join(
+                    full_response
+                ).strip()
 
                 if final_text:
                     logger.info(
@@ -191,12 +212,12 @@ class GeminiService:
                 return
 
             except APIError as exc:
-                code = getattr(exc, "code", None)
+                code = self._get_error_code(exc)
 
                 if emitted:
                     logger.error(
-                        f"Gemini stream stopped after partial "
-                        f"response: {exc}"
+                        f"Gemini stream stopped after "
+                        f"partial response: {exc}"
                     )
                     return
 
@@ -204,8 +225,21 @@ class GeminiService:
                     raise
 
                 logger.warning(
-                    f"Gemini key {index + 1}/{total} failed "
-                    f"({code}) — rotating"
+                    f"Gemini key {index + 1}/{total} "
+                    f"failed ({code}) — rotating"
+                )
+
+            except httpx.TimeoutException:
+                if emitted:
+                    logger.error(
+                        f"Gemini stream key {index + 1} "
+                        f"timed out after partial response"
+                    )
+                    return
+
+                logger.warning(
+                    f"Gemini key {index + 1}/{total} "
+                    f"timed out — rotating"
                 )
 
             except Exception as exc:
@@ -225,8 +259,10 @@ class GeminiService:
     ) -> str:
         chunks = []
 
-        async for chunk in self.generate_reply_stream_from_contents(
-            contents
+        async for chunk in (
+            self.generate_reply_stream_from_contents(
+                contents
+            )
         ):
             chunks.append(chunk)
 
@@ -253,7 +289,9 @@ class GeminiService:
             types.Content(
                 role="user",
                 parts=[
-                    types.Part(text=user_text)
+                    types.Part(
+                        text=user_text
+                    )
                 ],
             )
         )
