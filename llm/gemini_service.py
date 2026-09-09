@@ -13,7 +13,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 GEMINI_TIMEOUT_MS = 15000
-ROTATE_CODES = {401, 403, 429}
+ROTATE_CODES = {401, 403, 429, 500, 502, 503, 504}
 
 
 class AllGeminiKeysExhausted(Exception):
