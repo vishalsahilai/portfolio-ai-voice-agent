@@ -2,7 +2,7 @@
 
 A real-time, browser-based AI voice assistant built for a personal portfolio. **Sada** lets visitors speak naturally, see their own speech appear live, receive grounded answers about Vishal Sahil, and hear the AI response while the response text appears in sync with the generated voice.
 
-The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **Pinecone RAG**, **Gemini streaming**, **MongoDB conversation memory**, and **ElevenLabs streaming TTS** in one low-latency voice pipeline.
+The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **Pinecone RAG**, **Alibaba Cloud Qwen primary LLM with Gemini fallback**, **MongoDB conversation memory**, and **ElevenLabs streaming TTS** in one low-latency voice pipeline.
 
 > Repository: `https://github.com/vishalsahilai/portfolio-ai-voice-agent`
 
@@ -11,20 +11,39 @@ The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **P
 ## Features
 
 - Real-time microphone audio from the browser
+
 - Live user transcription while the user is still speaking
+
 - Deepgram streaming speech-to-text with interim results
+
 - Retrieval-Augmented Generation (RAG) using Pinecone
+
 - Grounded portfolio answers from indexed knowledge documents
+
 - Multi-turn MongoDB conversation memory
+
 - Three-phase memory/context strategy to control prompt size
-- Gemini streaming response generation
+
+- Alibaba Cloud Qwen streaming response generation
+
+- Automatic Qwen model fallback (`qwen-plus-character` → `qwen-flash-character`)
+
+- Gemini provider fallback with API-key rotation
+
 - ElevenLabs WebSocket text-to-speech streaming
+
 - Word/character-aligned agent captions synchronized with playback
+
 - Pre-connected TTS to reduce response latency
+
 - Parallel RAG, memory, and TTS connection work
+
 - API-key/account rotation and fallback handling
+
 - Browser mic suppression while the agent is speaking
+
 - Clean WebSocket/session cleanup when a call ends
+
 - Automatic MongoDB TTL cleanup for expired sessions
 
 ---
@@ -32,17 +51,31 @@ The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **P
 ## Technology Stack
 
 | Layer | Technology | Purpose |
+
 |---|---|---|
+
 | Backend | FastAPI + Uvicorn | HTTP server and real-time WebSocket endpoint |
+
 | Frontend | HTML, CSS, JavaScript | Browser voice-call interface |
+
 | Transport | WebSocket | Bidirectional control messages and audio streaming |
+
 | Speech-to-Text | Deepgram Nova-3 | Streaming transcription and interim results |
-| LLM | Google Gemini | Streaming response generation and summaries |
+
+| Primary LLM | Alibaba Cloud Qwen | Streaming response generation |
+
+| LLM fallback | Google Gemini | Provider fallback and key rotation |
+
 | Retrieval | Pinecone | Semantic search over portfolio knowledge |
+
 | Embeddings | Pinecone `llama-text-embed-v2` | Query/document vector representation |
+
 | Memory | MongoDB | Session state, recent messages, and summaries |
+
 | Text-to-Speech | ElevenLabs | Streaming voice generation |
+
 | Audio playback | MediaSource + MP3 | Incremental browser playback |
+
 | Logging | Python application logger | Runtime visibility and latency diagnostics |
 
 ---
@@ -50,54 +83,103 @@ The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **P
 ## High-Level Architecture
 
 ```text
+
 ┌───────────────────────────────────────────────────────────────────┐
+
 │                         Browser Frontend                          │
+
 │                                                                   │
+
 │  Microphone                                                       │
+
 │      │                                                            │
+
 │      ▼                                                            │
+
 │  Web Audio API                                                    │
+
 │      │  48 kHz browser audio                                     │
+
 │      ▼                                                            │
+
 │  Resample → PCM16 / 16 kHz                                       │
+
 │      │                                                            │
+
 │      └──────────── WebSocket /ws/call ───────────────────────┐    │
+
 │                                                              │    │
+
 │  Live user text ◀────────────────────────────────────────────┤    │
+
 │  Agent audio + aligned captions ◀────────────────────────────┘    │
+
 └───────────────────────────────────────────────────────────────────┘
+
                                │
+
                                ▼
+
 ┌───────────────────────────────────────────────────────────────────┐
+
 │                         FastAPI Backend                           │
+
 │                                                                   │
+
 │  Deepgram STT                                                     │
+
 │      │                                                            │
+
 │      ├── Interim transcript ───────────────► Browser live text    │
+
 │      │                                                            │
+
 │      └── Final utterance                                          │
+
 │             │                                                     │
+
 │             ▼                                                     │
+
 │       Call State Machine                                          │
+
 │       LISTENING → THINKING → SPEAKING                             │
+
 │             │                                                     │
+
 │             ├────────► MongoDB memory                             │
+
 │             ├────────► Pinecone RAG                               │
+
 │             └────────► ElevenLabs pre-connect                     │
+
 │                    (parallel work)                                │
+
 │             │                                                     │
+
 │             ▼                                                     │
-│       Gemini context                                              │
+
+│       LLM context                                              │
+
 │             │                                                     │
+
 │             ▼                                                     │
-│       Gemini streaming text                                      │
+
+│       Alibaba Qwen streaming text / Gemini fallback                                      │
+
 │             │                                                     │
+
 │             ▼                                                     │
+
 │       ElevenLabs streaming TTS                                   │
+
 │             │                                                     │
+
 │             ├── MP3 chunks ───────────────► Browser playback      │
+
 │             └── alignment ────────────────► Live agent captions   │
+
 └───────────────────────────────────────────────────────────────────┘
+
 ```
 
 ---
@@ -109,15 +191,21 @@ The system combines **FastAPI**, **WebSockets**, **Deepgram streaming STT**, **P
 The browser opens:
 
 ```text
+
 ws://localhost:8001/ws/call
+
 ```
 
 The backend:
 
 1. accepts the WebSocket;
+
 2. creates a call session;
+
 3. creates the MongoDB session;
+
 4. connects a Deepgram streaming STT session;
+
 5. sends the greeting event to the frontend.
 
 The greeting audio is played first. While the greeting is playing, microphone transmission is disabled so the assistant does not transcribe its own voice.
@@ -131,23 +219,37 @@ The browser uses `getUserMedia()` and the Web Audio API.
 Typical browser microphone audio is 48 kHz. The frontend converts it to the format expected by the backend/STT pipeline:
 
 ```text
+
 Browser microphone
+
      ↓
+
 Float32 samples
+
      ↓
+
 Resample to 16,000 Hz
+
      ↓
+
 Convert to signed PCM16
+
      ↓
+
 Send binary frames through WebSocket
+
 ```
 
 Target format:
 
 ```text
+
 Sample rate: 16000 Hz
+
 Encoding: linear16 / PCM16
+
 Channels: 1
+
 ```
 
 ---
@@ -159,12 +261,19 @@ Deepgram runs as a persistent WebSocket connection for the call.
 Important options include:
 
 ```text
+
 model = nova-3
+
 language = en-US
+
 interim_results = true
+
 smart_format = true
+
 punctuate = true
+
 vad_events = true
+
 ```
 
 Because `interim_results=true`, the browser can show speech before the user finishes the sentence.
@@ -172,11 +281,17 @@ Because `interim_results=true`, the browser can show speech before the user fini
 Example:
 
 ```text
+
 You: Hello
+
 You: Hello I want
+
 You: Hello I want to know more
+
 You: Hello I want to know more about Vishal
+
 You: Hello I want to know more about Vishal and his experience.
+
 ```
 
 The frontend updates the **same `You:` line** instead of adding one new line for every partial result.
@@ -185,24 +300,97 @@ When Deepgram marks the utterance complete, the final sentence is pushed to the 
 
 ---
 
+## Daily Browser Voice Limit
+
+Sada allows **7 successfully completed AI questions per browser per calendar day**.
+
+The frontend stores anonymous daily usage in browser `localStorage` using:
+
+```text
+sada_voice_daily_usage
+```
+
+Example stored value:
+
+```json
+{
+  "date": "YYYY-MM-DD",
+  "used": 7
+}
+```
+
+Usage survives refreshes, ending/restarting a call, and opening a new call in the same browser on the same day. On the next local calendar day, the counter starts again from zero.
+
+The WebSocket is opened with the browser's current usage, for example:
+
+```text
+/ws/call?used=4
+```
+
+After each successful answer, the backend sends:
+
+```json
+{
+  "type": "usage_update",
+  "used": 5,
+  "limit": 7
+}
+```
+
+When all seven questions have been used, the next attempt is blocked before expensive response generation. The backend sends:
+
+```json
+{
+  "type": "play_limit_reached",
+  "used": 7,
+  "limit": 7
+}
+```
+
+The frontend then plays the prerecorded `/limit-reached.mp3`, disables microphone sending, and ends the call after playback. The blocked attempt does **not** run Pinecone RAG, Alibaba Qwen, Gemini fallback, or ElevenLabs response generation.
+
+Current prerecorded message:
+
+> You've reached today's seven-question limit. Thanks for chatting with me. Please come back tomorrow to start a new conversation.
+
+If the browser already knows it is at `7/7` before a new call starts, the frontend can block locally and play the prerecorded message without opening a new AI voice session.
+
+This is intentionally browser-local tracking. Clearing site storage, using Incognito/private browsing, switching browsers, or switching devices can create a fresh allowance.
+
+---
+
 ## Call State Machine
 
 The voice pipeline uses three main states:
 
 ```text
+
 LISTENING
+
    │
+
    │ final user utterance
+
    ▼
+
 THINKING
+
    │
+
    │ response generation begins
+
    ▼
+
 SPEAKING
+
    │
+
    │ response finishes
+
    ▼
+
 LISTENING
+
 ```
 
 ### No user interruption during agent speech
@@ -212,7 +400,9 @@ The current design intentionally prevents barge-in.
 While the assistant is speaking:
 
 - the frontend sets `canSendMic = false`;
+
 - microphone frames are not sent;
+
 - the backend also accepts microphone audio only while the call state is `LISTENING`.
 
 The microphone resumes only after the agent audio has finished playing in the browser.
@@ -226,30 +416,51 @@ The agent does not depend only on the LLM's general knowledge. Portfolio informa
 Current runtime flow:
 
 ```text
+
 User question
+
     ↓
+
 Pinecone embedding request
+
     ↓
+
 llama-text-embed-v2
+
     ↓
+
 Pinecone index: voice-agent
+
     ↓
+
 Similarity search
+
     ↓
+
 top_k = 3
+
     ↓
+
 Relevant chunks
+
     ↓
-Gemini context
+
+LLM context
+
 ```
 
 This allows the agent to answer questions such as:
 
 - What experience does Vishal have?
+
 - Which skills does he have?
+
 - What projects has he built?
+
 - What technologies does he use?
+
 - How can I contact him?
+
 - Where is his portfolio?
 
 ### Important embedding rule
@@ -259,7 +470,9 @@ The embedding model used when **ingesting documents** must match the embedding m
 The current runtime uses:
 
 ```text
+
 llama-text-embed-v2
+
 ```
 
 Do not mix vectors created by a different embedding model in the same retrieval space, even if the vector dimensions happen to match. If the embedding model changes, re-ingest the knowledge base.
@@ -273,32 +486,47 @@ When your resume, experience, skills, projects, contact details, or portfolio co
 A recommended project layout is:
 
 ```text
+
 data/
+
 └── portfolio.pdf          # or your current portfolio/resume knowledge file
+
+
 
 
 
 ### Standard update workflow
 
 1. Replace or edit the source document in the project's knowledge/data folder.
+
 2. Activate the project virtual environment.
+
 3. Run the ingestion script.
+
 4. Confirm the vectors were written to the `voice-agent` Pinecone index.
+
 5. Restart the backend if required by your local workflow.
+
 6. Ask the agent a question that depends on the newly added information.
 
 Run:
 
 ```bash
+
 source venv/bin/activate
+
 python -m rag.ingest
+
 ```
 
 Windows:
 
 ```powershell
+
 venv\Scripts\activate
+
 python -m rag.ingest
+
 ```
 
 ### When replacing an existing document
@@ -308,19 +536,33 @@ The ingestion process should use deterministic vector IDs or clear the relevant 
 The safe logical process is:
 
 ```text
+
 Updated document
+
       ↓
+
 Remove/replace old vectors for that document
+
       ↓
+
 Extract text
+
       ↓
+
 Split into chunks
+
       ↓
+
 Embed with llama-text-embed-v2
+
       ↓
+
 Upsert into Pinecone index: voice-agent
+
       ↓
+
 Verify retrieval
+
 ```
 
 ### Verify after ingestion
@@ -330,15 +572,21 @@ Start the application and ask a question that can only be answered by the update
 Example:
 
 ```text
+
 User: What is Vishal's newest project?
+
 ```
 
 Check the backend logs for messages similar to:
 
 ```text
+
 Generating embeddings with model 'llama-text-embed-v2'
+
 Querying index with top_k=3
+
 RAG: retrieved 3 chunks
+
 ```
 
 If retrieval still returns old facts, check that stale vectors were removed or overwritten during re-ingestion.
@@ -356,7 +604,9 @@ The conversation context is intentionally compressed instead of continually send
 ### Phase 1 — first user turn
 
 ```text
+
 Current user message only
+
 ```
 
 No previous conversation needs to be injected.
@@ -364,9 +614,13 @@ No previous conversation needs to be injected.
 ### Phase 2 — second user turn
 
 ```text
+
 Previous user message
+
 + previous agent response
+
 + current user message
+
 ```
 
 This preserves direct conversational continuity.
@@ -374,9 +628,13 @@ This preserves direct conversational continuity.
 ### Phase 3 — later turns
 
 ```text
+
 Conversation summaries
+
 + current relevant context
+
 + current user message
+
 ```
 
 Older exchanges are summarized and stored instead of repeatedly sending the entire raw history.
@@ -384,34 +642,53 @@ Older exchanges are summarized and stored instead of repeatedly sending the enti
 Benefits:
 
 - smaller prompts;
+
 - lower token usage;
+
 - faster context construction;
+
 - better long-conversation scalability;
+
 - preserved conversational context.
 
 Summary generation is performed as background work after the main voice response, so it does not need to block the current reply.
 
 ---
 
-## Gemini Response Generation
+## Multi-Provider LLM Routing
 
-The final user utterance, retrieved RAG context, and memory context are passed to Gemini.
+The final user utterance, retrieved RAG context, and memory context are passed through a centralized LLM service.
 
-Gemini uses streaming generation rather than waiting for the entire response.
+### Primary provider — Alibaba Cloud Qwen
+
+Current model order:
 
 ```text
-Gemini
-  ↓
-"Vishal "
-  ↓
-"is an AI "
-  ↓
-"Automation Engineer..."
+1. qwen-plus-character
+2. qwen-flash-character
 ```
 
-Those text chunks are immediately forwarded to ElevenLabs instead of waiting for the complete answer.
+The service tries the first available Qwen model. If it is unavailable, rate-limited, temporarily failing, or its free allocation is exhausted, the service automatically moves to the next configured Qwen model.
 
-This reduces perceived latency and allows TTS generation to begin earlier.
+### Gemini fallback
+
+If the configured Alibaba/Qwen models are unavailable, the request automatically falls back to the existing Gemini service and its API-key rotation. No manual provider switching is required.
+
+Conceptual routing:
+
+```text
+User turn
+   ↓
+qwen-plus-character
+   ↓ failure/unavailable
+qwen-flash-character
+   ↓ failure/unavailable
+Gemini key rotation
+```
+
+LLM text is streamed immediately into ElevenLabs instead of waiting for the complete answer.
+
+Important behavior: if part of a response has already been streamed/spoken and the provider connection then fails, the system does not restart the same answer through another provider because that could duplicate spoken content.
 
 ---
 
@@ -422,15 +699,21 @@ The system uses the ElevenLabs streaming WebSocket endpoint rather than generati
 The connection enables synchronized alignment data:
 
 ```text
+
 sync_alignment=true
+
 ```
 
 The server receives packets containing:
 
 ```text
+
 audio
+
 alignment
+
 is_final
+
 ```
 
 The audio field is decoded and streamed to the browser immediately.
@@ -438,9 +721,13 @@ The audio field is decoded and streamed to the browser immediately.
 The alignment object contains character timing data such as:
 
 ```text
+
 chars
+
 char_start_times_ms
+
 char_durations_ms
+
 ```
 
 The frontend uses these timings together with the audio element's `currentTime` to reveal the agent's response as it is actually spoken.
@@ -448,14 +735,19 @@ The frontend uses these timings together with the audio element's `currentTime` 
 Example:
 
 ```text
+
 Audio says: "Vishal"
+
 Screen:     Agent: Vishal
 
 Audio says: "is an AI"
+
 Screen:     Agent: Vishal is an AI
 
 Audio says: "Automation Engineer"
+
 Screen:     Agent: Vishal is an AI Automation Engineer
+
 ```
 
 This is different from displaying the entire LLM response before the audio starts.
@@ -471,19 +763,33 @@ Reducing perceived latency was a major design goal.
 The initial flow effectively behaved like this:
 
 ```text
+
 Final transcript
+
       ↓
+
 MongoDB + Pinecone RAG
+
       ↓
-Build Gemini context
+
+Build LLM context
+
       ↓
+
 Connect ElevenLabs WebSocket
+
       ↓
+
 Start Gemini
+
       ↓
+
 Generate TTS
+
       ↓
+
 First audio
+
 ```
 
 Each network step added to the previous one.
@@ -493,21 +799,37 @@ Each network step added to the previous one.
 The current implementation starts independent work at the same time:
 
 ```text
+
                         ┌── MongoDB message update
+
 Final transcript ───────┼── Pinecone RAG
+
                         └── ElevenLabs WebSocket pre-connect
+
                                   │
+
                                   ▼
-                           Build Gemini context
+
+                           Build LLM context
+
                                   │
+
                                   ▼
-                           Gemini streaming
+
+                           LLM streaming
+
                                   │
+
                                   ▼
+
                       Already-connected ElevenLabs
+
                                   │
+
                                   ▼
+
                               First audio
+
 ```
 
 The important optimization is that ElevenLabs connection time is hidden behind work that was already necessary for RAG and memory.
@@ -517,23 +839,35 @@ The important optimization is that ElevenLabs connection time is hidden behind w
 Observed local tests showed approximately:
 
 ```text
-Memory + RAG:       ~1.5–2.3 seconds
-Warm first audio:   ~3.3–4.4 seconds
-Cold/warm-up turn:  can be ~5+ seconds
+
+Memory + RAG:       \~1.5–2.3 seconds
+
+Warm first audio:   \~3.3–4.4 seconds
+
+Cold/warm-up turn:  can be \~5+ seconds
+
 ```
 
-Actual latency varies with API/network conditions, model warm-up, Pinecone rate limits, Gemini first-token time, and browser playback startup.
+Actual latency varies with API/network conditions, model warm-up, Pinecone rate limits, LLM first-token time, and browser playback startup.
 
 ### Additional latency optimizations already used
 
 - persistent Deepgram WebSocket per call;
-- Gemini streaming instead of full-response generation;
+
+- LLM streaming instead of full-response generation;
+
 - ElevenLabs streaming instead of full-file synthesis;
+
 - TTS WebSocket pre-connect in parallel with RAG;
+
 - MongoDB work and Pinecone retrieval executed concurrently;
+
 - background post-turn summarization;
+
 - direct binary audio frames over the existing WebSocket;
+
 - immediate MediaSource playback;
+
 - live captions driven by audio alignment rather than waiting for final text.
 
 ---
@@ -545,27 +879,43 @@ Deepgram emits interim transcription events while the user speaks.
 The backend forwards them to the browser as control messages such as:
 
 ```json
+
 {
+
   "type": "user_speech_start"
+
 }
+
 ```
 
 ```json
+
 {
+
   "type": "user_transcript",
+
   "text": "Hello I want to know more",
+
   "is_final": false,
+
   "speech_final": false
+
 }
+
 ```
 
 At the end of the utterance:
 
 ```json
+
 {
+
   "type": "user_transcript_end",
+
   "text": "Hello I want to know more about Vishal."
+
 }
+
 ```
 
 The frontend keeps one active user transcript element and updates its contents as the sentence grows.
@@ -577,7 +927,9 @@ The frontend keeps one active user transcript element and updates its contents a
 Main endpoint:
 
 ```text
+
 /ws/call
+
 ```
 
 ### Browser → server
@@ -585,7 +937,9 @@ Main endpoint:
 Binary WebSocket frames:
 
 ```text
+
 PCM16 microphone audio at 16 kHz
+
 ```
 
 ### Server → browser control messages
@@ -593,16 +947,31 @@ PCM16 microphone audio at 16 kHz
 Examples:
 
 ```text
+
 session_started
+
 play_greeting
+
 user_speech_start
+
 user_transcript
+
 user_transcript_end
+
 audio_start
+
 audio_alignment
+
 audio_end
+
 stop_audio
+
+usage_update
+
+play_limit_reached
+
 error
+
 ```
 
 ### Server → browser binary frames
@@ -619,9 +988,9 @@ The project is designed to work with multiple configured API credentials where s
 
 A new call can start from a different configured key slot. If a key fails, the session can move to another configured key.
 
-### Gemini
+### Gemini fallback
 
-Gemini request logic supports key rotation/fallback when a configured key is unavailable or exhausted.
+Gemini is the fallback LLM provider. Its request logic supports key rotation when a configured key is unavailable or exhausted.
 
 ### ElevenLabs
 
@@ -636,57 +1005,111 @@ Do not commit any API credentials to GitHub.
 The exact repository may evolve, but the core architecture is organized around these components:
 
 ```text
+
 portfolio-ai-voice-agent/
+
 │
+
 ├── main.py
+
 │
+
 ├── api/
+
 │   └── websocket_routes.py
+
 │
+
 ├── audio/
+
 │   └── stt_deepgram.py
+
 │
+
 ├── call/
+
 │   ├── call_state_machine.py
+
 │   └── session_manager.py
+
 │
+
 ├── llm/
+
 │   └── gemini_service.py
+
 │
+
 ├── memory/
+
 │   ├── memory_manager.py
+
 │   ├── summarizer.py
+
 │   └── context_builder.py
+
 │
+
 ├── rag/
+
 │   ├── retriever.py
+
 │   ├── embeddings.py
+
 │    ├── ingest.py
+
 │    └── vector_store.py
+
 │
+
 ├── tts/
+
 │   └── voice_manager.py
+
 │
+
 ├── config/
+
 │   └── settings.py
+
 │
+
 ├── utils/
+
 │   └── logger.py
+
 │
+
 ├── scripts/
+
 │   └── ingest.py
+
 │
+
 ├── data/
+
 │   └── ... knowledge documents ...
+
 │
+
 ├── frontend/
+
 │   ├── index.html
+
 │   ├── style.css
-│   └── app.js
+
+│   ├── app.js
+│   ├── greeting.mp3
+│   └── limit-reached.mp3
+
 │
+
 ├── requirements.txt
+
 ├── .env
+
 └── README.md
+
 ```
 
 ---
@@ -696,12 +1119,19 @@ portfolio-ai-voice-agent/
 ### Prerequisites
 
 - Python 3.11 recommended
+
 - Git
+
 - Deepgram account/API key
+
 - Gemini API key(s)
+
 - ElevenLabs account/API key + voice ID
+
 - Pinecone API key and `voice-agent` index
+
 - MongoDB connection string
+
 - Modern browser with microphone support
 
 ---
@@ -709,8 +1139,11 @@ portfolio-ai-voice-agent/
 ### 1. Clone the repository
 
 ```bash
+
 git clone https://github.com/vishalsahilai/portfolio-ai-voice-agent.git
+
 cd portfolio-ai-voice-agent
+
 ```
 
 ---
@@ -720,15 +1153,21 @@ cd portfolio-ai-voice-agent
 macOS/Linux:
 
 ```bash
+
 python3 -m venv venv
+
 source venv/bin/activate
+
 ```
 
 Windows:
 
 ```powershell
+
 python -m venv venv
+
 venv\Scripts\activate
+
 ```
 
 ---
@@ -736,10 +1175,12 @@ venv\Scripts\activate
 ### 3. Install dependencies
 
 ```bash
+
 pip install -r requirements.txt
+
 ```
 
-Core dependencies include FastAPI/Uvicorn, Deepgram-compatible WebSocket handling, Google GenAI, ElevenLabs, Pinecone, MongoDB/Motor, and environment/configuration packages.
+Core dependencies include FastAPI/Uvicorn, Deepgram-compatible WebSocket handling, Alibaba Qwen + Google GenAI fallback, ElevenLabs, Pinecone, MongoDB/Motor, and environment/configuration packages.
 
 ---
 
@@ -748,7 +1189,9 @@ Core dependencies include FastAPI/Uvicorn, Deepgram-compatible WebSocket handlin
 Create `.env` from the repository example if one exists:
 
 ```bash
+
 cp .env.example .env
+
 ```
 
 Configure the values expected by `config/settings.py`.
@@ -756,33 +1199,59 @@ Configure the values expected by `config/settings.py`.
 Typical categories are:
 
 ```env
+
 # Application
+
 PORT=8001
 
 # Deepgram
+
 DEEPGRAM_API_KEY1=
+
 DEEPGRAM_API_KEY2=
+
 DEEPGRAM_API_KEY3=
+
 DEEPGRAM_API_KEY4=
+
 DEEPGRAM_MODEL=nova-3
+
 DEEPGRAM_LANGUAGE=en-US
+
 DEEPGRAM_ENDPOINTING_MS=350
+
 DEEPGRAM_UTTERANCE_END_MS=1000
 
-# Gemini
+# Alibaba Cloud / Qwen
+
+ALIBABA_API_KEY=
+
+ALIBABA_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+ALIBABA_MODELS=qwen-plus-character,qwen-flash-character
+
+# Gemini fallback
+
 # Add the Gemini key variables expected by config/settings.py
-GEMINI_MODEL=gemini-3.1-flash-lite
+
+GEMINI_MODEL=gemini-3.5-flash-lite
 
 # ElevenLabs
+
 # Add account API key(s) and voice ID(s) expected by config/settings.py
+
 ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 
 # Pinecone
+
 PINECONE_API_KEY=
+
 PINECONE_INDEX_NAME=voice-agent
 
 # MongoDB
+
 MONGODB_URI=
+
 ```
 
 > Never commit `.env` or real credentials.
@@ -794,7 +1263,9 @@ MONGODB_URI=
 If the Pinecone knowledge base is not populated yet, or if the source document changed:
 
 ```bash
+
 python scripts/ingest.py
+
 ```
 
 Make sure ingestion and querying both use the same embedding model (`llama-text-embed-v2` in the current runtime).
@@ -804,16 +1275,23 @@ Make sure ingestion and querying both use the same embedding model (`llama-text-
 ### 6. Start the application
 
 ```bash
+
 python main.py
+
 ```
 
 Expected startup output includes messages similar to:
 
 ```text
+
 Uvicorn running on http://0.0.0.0:8001
+
 Pinecone ready ✅
+
 MongoDB memory ready ✅
+
 AI Voice Agent ready ✅
+
 ```
 
 ---
@@ -823,13 +1301,17 @@ AI Voice Agent ready ✅
 Use:
 
 ```text
+
 http://localhost:8001
+
 ```
 
 Do **not** open:
 
 ```text
+
 http://0.0.0.0:8001
+
 ```
 
 `0.0.0.0` is the server bind address. `localhost` should be used in the browser so microphone APIs are available in the local secure-context exception supported by modern browsers.
@@ -843,20 +1325,69 @@ Allow microphone permission when prompted.
 Before deployment, verify:
 
 - [ ] Page opens at `http://localhost:8001`
+
 - [ ] Browser microphone permission works
+
 - [ ] Greeting plays
+
 - [ ] Mic remains blocked during greeting
+
 - [ ] Live user words appear while speaking
+
 - [ ] Final transcript is correct
+
 - [ ] Pinecone retrieves relevant context
-- [ ] Gemini response starts streaming
+
+- [ ] Alibaba Qwen response starts streaming
+
 - [ ] ElevenLabs audio begins without waiting for the full answer
+
 - [ ] Agent text appears in sync with spoken audio
+
 - [ ] Mic remains blocked while agent speaks
+
 - [ ] Mic resumes after browser playback ends
+
 - [ ] Multi-turn memory works
+
+- [ ] `usage_update` updates browser daily usage
+
+- [ ] questions 1–7 receive normal answers
+
+- [ ] question 8 is blocked before RAG/LLM/TTS
+
+- [ ] `limit-reached.mp3` plays when the limit is reached
+
+- [ ] refresh/new call preserves the same-day limit
+
+- [ ] next calendar day resets the browser allowance
+
 - [ ] End Call cleans up the WebSocket and Deepgram session
+
 - [ ] No uncaught traceback appears after normal call termination
+
+---
+
+## Testing the Daily Limit Without Wasting API Tokens
+
+The frontend limit behavior can be tested directly from the browser console without asking seven real AI questions:
+
+```javascript
+handleControlMessage({
+  type: "play_limit_reached",
+  used: 7,
+  limit: 7
+});
+```
+
+This test uses no Deepgram, Pinecone, Alibaba, Gemini, or ElevenLabs response tokens.
+
+To reset local development usage:
+
+```javascript
+localStorage.removeItem("sada_voice_daily_usage");
+location.reload();
+```
 
 ---
 
@@ -865,22 +1396,35 @@ Before deployment, verify:
 When the visitor presses **End Call**:
 
 1. browser playback is stopped;
+
 2. microphone processing is stopped;
+
 3. the client WebSocket is closed;
+
 4. the backend receives the disconnect;
+
 5. active call tasks are cancelled/cleaned up;
+
 6. Deepgram is closed;
+
 7. the in-memory call session is ended;
+
 8. resources are released.
 
 Normal logs may include:
 
 ```text
+
 Client disconnected
+
 connection closed
+
 Deepgram session closed
+
 Session ended
+
 Session cleaned up
+
 ```
 
 These messages are expected cleanup, not errors.
@@ -896,13 +1440,17 @@ Background persistence/summarization that already started for a completed turn m
 Open:
 
 ```text
+
 http://localhost:8001
+
 ```
 
 instead of:
 
 ```text
+
 http://0.0.0.0:8001
+
 ```
 
 Then allow microphone access in the browser.
@@ -916,23 +1464,62 @@ The browser is probably running an older cached `app.js`.
 Hard refresh:
 
 ```text
+
 macOS: Cmd + Shift + R
+
 Windows/Linux: Ctrl + Shift + R
+
 ```
 
 You can also open:
 
 ```text
+
 http://localhost:8001/app.js
+
 ```
 
 and verify that it contains handlers for:
 
 ```text
+
 user_speech_start
+
 user_transcript
+
 user_transcript_end
+
 ```
+
+---
+
+### Daily-limit messages appear as `Unknown message`
+
+The browser is probably running an older cached `app.js`. Verify the served JavaScript contains handlers for:
+
+```text
+usage_update
+play_limit_reached
+DAILY_QUESTION_LIMIT
+```
+
+Use a cache-busting script URL such as:
+
+```html
+<script src="/app.js?v=20260911-3"></script>
+```
+
+Then hard refresh the page.
+
+### `limit-reached.mp3` does not play
+
+Open it directly:
+
+```text
+http://localhost:8001/limit-reached.mp3
+```
+
+If it does not play, confirm that the file is inside the frontend/static directory served by FastAPI.
 
 ---
 
@@ -941,9 +1528,13 @@ user_transcript_end
 Check:
 
 1. the document was re-ingested after its latest update;
+
 2. the index name is `voice-agent`;
+
 3. ingestion and query use the same embedding model;
+
 4. old document vectors were replaced/removed;
+
 5. Pinecone returns relevant top-3 chunks.
 
 A matching vector dimension alone does **not** mean two different embedding models are compatible.
@@ -955,17 +1546,25 @@ A matching vector dimension alone does **not** mean two different embedding mode
 Use the latency logs:
 
 ```text
+
 Memory + RAG ready in X.XXs
+
 FIRST AUDIO in X.XXs ✅
+
 ```
 
 Interpretation:
 
 ```text
+
 Large RAG time       → embedding/Pinecone/network bottleneck
+
 Small RAG time but
-large FIRST AUDIO    → Gemini first-token/TTS/network bottleneck
+
+large FIRST AUDIO    → LLM first-token/TTS/network bottleneck
+
 First request only   → cold-start/warm-up behavior
+
 ```
 
 ---
@@ -981,30 +1580,55 @@ Check configured Deepgram keys. Remove or replace invalid key slots instead of r
 Check:
 
 - API key/account quota;
+
 - voice ID;
+
 - model ID;
+
 - WebSocket connectivity;
+
 - `sync_alignment=true`;
+
 - account rotation configuration.
 
 ---
 
 ## Deployment Notes
 
+Current production backend:
+
+```text
+https://portfolio-ai-voice-agent.onrender.com
+```
+
+Current production WebSocket:
+
+```text
+wss://portfolio-ai-voice-agent.onrender.com/ws/call
+```
+
 For production deployment:
 
 - serve the frontend through HTTPS;
+
 - use `wss://` for the voice WebSocket;
+
 - use the hosting platform's assigned `PORT`;
+
 - never expose API keys to frontend JavaScript;
-- keep all Deepgram, Gemini, ElevenLabs, Pinecone, and MongoDB credentials on the server;
+
+- keep all Deepgram, Alibaba, Gemini, ElevenLabs, Pinecone, and MongoDB credentials on the server;
+
 - configure allowed origins if frontend and backend are hosted separately;
+
 - test browser microphone permissions on the final HTTPS domain.
 
 Example production WebSocket concept:
 
 ```text
-wss://your-backend-domain.com/ws/call
+
+wss://portfolio-ai-voice-agent.onrender.com/ws/call
+
 ```
 
 Do not hard-code `ws://localhost:8001/ws/call` for the deployed site.
@@ -1014,11 +1638,17 @@ Do not hard-code `ws://localhost:8001/ws/call` for the deployed site.
 ## Security Notes
 
 - Never commit `.env`.
+
 - Revoke any API key accidentally exposed in Git history.
+
 - Keep provider keys server-side only.
+
 - Do not log complete secrets.
+
 - Use separate development and production credentials where possible.
+
 - Validate all client control messages.
+
 - Keep dependency versions pinned for reproducible deployments.
 
 ---
@@ -1030,12 +1660,19 @@ The project is optimized around **time to first audible response**, not only tot
 The most important performance decisions are:
 
 1. persistent Deepgram connection during a call;
+
 2. interim STT for immediate user feedback;
+
 3. parallel MongoDB + Pinecone + ElevenLabs connection work;
-4. streaming Gemini generation;
+
+4. streaming Alibaba Qwen generation with Gemini fallback;
+
 5. streaming text directly into ElevenLabs;
+
 6. streaming MP3 chunks directly to browser playback;
+
 7. synchronized captions using ElevenLabs alignment;
+
 8. background memory summarization after the critical response path.
 
 The resulting pipeline behaves more like a real voice assistant than a traditional request/response chatbot.
@@ -1047,14 +1684,27 @@ The resulting pipeline behaves more like a real voice assistant than a tradition
 Potential future improvements include:
 
 - production deployment on Render or another persistent backend;
+
 - dynamic production WebSocket URL selection;
+
 - optional phone-number integration through Twilio/Telnyx/SIP;
+
 - RAG skip rules for greetings, thanks, and goodbye messages;
+
 - response caching for repeated portfolio questions;
+
 - persistent/pre-warmed TTS connection strategies where provider behavior allows it;
+
 - retrieval evaluation and automated RAG regression tests;
+
 - admin endpoint/tool for safe document re-ingestion;
+
 - automated knowledge-base sync when resume/portfolio files change;
+
+- per-stage latency instrumentation for embeddings, Pinecone query, context building, LLM first token, and TTS first chunk;
+
+- Pinecone/embedding latency optimization;
+
 - call analytics and latency dashboards.
 
 ---
@@ -1062,9 +1712,11 @@ Potential future improvements include:
 ## Author
 
 **Vishal Sahil**  
+
 AI Automation Engineer · AI Agent Developer · Prompt Engineer
 
 - Portfolio: `https://vishalsahilai.vercel.app`
+
 - GitHub: `https://github.com/vishalsahilai`
 
 ---
@@ -1078,28 +1730,39 @@ Add the repository's chosen license here. If the project is intended to be open 
 ## Quick Command Reference
 
 ```bash
+
 # Clone
+
 git clone https://github.com/vishalsahilai/portfolio-ai-voice-agent.git
+
 cd portfolio-ai-voice-agent
 
 # Virtual environment
+
 python3 -m venv venv
+
 source venv/bin/activate
 
 # Install
+
 pip install -r requirements.txt
 
 # Configure
+
 cp .env.example .env
 
 # Rebuild/update Pinecone knowledge
+
 python -m rag.ingest
 
 # Run
+
 python main.py
 
 # Open
+
 # http://localhost:8001
+
 ```
 
 ---
