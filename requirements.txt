@@ -16,3 +16,5 @@ pymongo
 motor
 
 pymupdf
+
+httpx>=0.27

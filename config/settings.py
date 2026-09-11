@@ -131,6 +131,33 @@ class Settings(BaseSettings):
     MONGODB_DB_NAME: str = "ai_voice_agent"
     SESSION_EXPIRY_HOURS: int = 2
 
+    @property
+    def ALIBABA_MODEL_LIST(self) -> list[str]:
+        return [
+            model.strip()
+            for model in self.ALIBABA_MODELS.split(",")
+            if model.strip()
+        ]
+
+    ALIBABA_API_KEY: str = ""
+
+    ALIBABA_BASE_URL: str = (
+        "https://dashscope-intl.aliyuncs.com/"
+        "compatible-mode/v1"
+    )
+
+    ALIBABA_MODELS: str = (
+        "qwen3.6-flash,"
+        "qwen3.5-flash,"
+        "qwen-flash"
+    )
+
+    ALIBABA_TIMEOUT_SECONDS: float = 5.0
+
+    ALIBABA_TRANSIENT_COOLDOWN_SECONDS: float = 30.0
+    ALIBABA_RATE_LIMIT_COOLDOWN_SECONDS: float = 60.0
+    ALIBABA_ACCESS_COOLDOWN_SECONDS: float = 300.0
+
 
 @lru_cache
 def get_settings() -> Settings:

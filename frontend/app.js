@@ -4,6 +4,8 @@ const WS_URL =
     : "wss://portfolio-ai-voice-agent.onrender.com/ws/call";
 const TARGET_SAMPLE_RATE = 16000;
 const STREAM_MIME = "audio/mpeg";
+const DAILY_QUESTION_LIMIT = 7;
+const DAILY_USAGE_KEY = "sada_voice_daily_usage";
 
 const callBtn = document.getElementById("callBtn");
 const statusEl = document.getElementById("status");
@@ -22,6 +24,7 @@ let isConnecting = false;
 let canSendMic = false;
 
 let greetingAudio = null;
+let limitAudio = null;
 
 let legacyAudio = null;
 let legacyAudioUrl = null;
@@ -341,6 +344,81 @@ function finishCaptionSync() {
 }
 
 
+function getLocalDateKey() {
+  const now = new Date();
+
+  const year = now.getFullYear();
+  const month = String(
+    now.getMonth() + 1
+  ).padStart(2, "0");
+
+  const day = String(
+    now.getDate()
+  ).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+
+function getDailyUsage() {
+  const today = getLocalDateKey();
+
+  try {
+    const raw =
+      localStorage.getItem(
+        DAILY_USAGE_KEY
+      );
+
+    if (!raw) {
+      return 0;
+    }
+
+    const data = JSON.parse(raw);
+
+    if (data.date !== today) {
+      localStorage.setItem(
+        DAILY_USAGE_KEY,
+        JSON.stringify({
+          date: today,
+          used: 0
+        })
+      );
+
+      return 0;
+    }
+
+    return Math.max(
+      0,
+      Math.min(
+        DAILY_QUESTION_LIMIT,
+        Number(data.used) || 0
+      )
+    );
+
+  } catch (_) {
+    return 0;
+  }
+}
+
+
+function setDailyUsage(used) {
+  const safeUsed = Math.max(
+    0,
+    Math.min(
+      DAILY_QUESTION_LIMIT,
+      Number(used) || 0
+    )
+  );
+
+  localStorage.setItem(
+    DAILY_USAGE_KEY,
+    JSON.stringify({
+      date: getLocalDateKey(),
+      used: safeUsed
+    })
+  );
+}
+
 // --------------------------------------------------
 // AUDIO CLEANUP
 // --------------------------------------------------
@@ -358,6 +436,22 @@ function stopGreeting() {
 
   greetingAudio.src = "";
   greetingAudio = null;
+}
+
+
+function stopLimitAudio() {
+  if (!limitAudio) return;
+
+  limitAudio.onended = null;
+  limitAudio.onerror = null;
+
+  try {
+    limitAudio.pause();
+    limitAudio.currentTime = 0;
+  } catch (_) {}
+
+  limitAudio.src = "";
+  limitAudio = null;
 }
 
 
@@ -443,6 +537,7 @@ function cleanupStreamAudio() {
 function stopAllAgentAudio(resumeListening = false) {
   stopCaptionSync();
   stopGreeting();
+  stopLimitAudio();
   stopLegacyAudio();
   stopBufferedAudio();
   cleanupStreamAudio();
@@ -1004,6 +1099,51 @@ function playGreeting() {
 }
 
 
+function playLimitReachedAudio() {
+  canSendMic = false;
+
+  stopAllAgentAudio(false);
+
+  statusEl.textContent =
+    "Daily voice limit reached";
+
+  limitAudio =
+    new Audio("/limit-reached.mp3");
+
+  limitAudio.preload = "auto";
+
+  limitAudio.onended = () => {
+    limitAudio = null;
+    stopCall();
+  };
+
+  limitAudio.onerror = () => {
+    log(
+      "Limit message playback failed.",
+      "system"
+    );
+
+    limitAudio = null;
+    stopCall();
+  };
+
+  limitAudio.play().catch((err) => {
+    log(
+      `Limit audio error: ${err.message}`,
+      "system"
+    );
+
+    limitAudio = null;
+    stopCall();
+  });
+
+  log(
+    "Agent: You've reached today's seven-question limit. Please come back tomorrow.",
+    "agent"
+  );
+}
+
+
 // --------------------------------------------------
 // SERVER MESSAGES
 // --------------------------------------------------
@@ -1090,6 +1230,22 @@ function handleControlMessage(msg) {
       break;
 
 
+    case "usage_update":
+      setDailyUsage(
+        msg.used
+      );
+      break;
+
+
+    case "play_limit_reached":
+      setDailyUsage(
+        DAILY_QUESTION_LIMIT
+      );
+
+      playLimitReachedAudio();
+      break;
+
+
     case "error":
       log(
         `Server error: ${
@@ -1123,6 +1279,14 @@ function handleControlMessage(msg) {
 // --------------------------------------------------
 
 async function startCall() {
+  if (
+    getDailyUsage() >=
+    DAILY_QUESTION_LIMIT
+  ) {
+    playLimitReachedAudio();
+    return;
+  }
+
   if (isConnecting || isCallActive) return;
 
   isConnecting = true;
@@ -1146,8 +1310,21 @@ async function startCall() {
 
     isCallActive = true;
 
+    const usedToday =
+      getDailyUsage();
+
+    const socketUrl =
+      new URL(WS_URL);
+
+    socketUrl.searchParams.set(
+      "used",
+      String(usedToday)
+    );
+
     ws =
-      new WebSocket(WS_URL);
+      new WebSocket(
+        socketUrl.toString()
+      );
 
     ws.binaryType =
       "arraybuffer";

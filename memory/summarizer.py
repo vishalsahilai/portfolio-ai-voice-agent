@@ -158,7 +158,7 @@ async def _run_summarization(
     Errors are caught and logged; they never surface to the WebSocket.
     """
     try:
-        from llm.gemini_service import gemini_service  # local import avoids circular dependency
+        from llm.llm_service import llm_service  # local import avoids circular dependency
 
         # Strip any JSON blocks from bot_text before summarizing
         clean_bot_text = _strip_json_blocks(bot_text)
@@ -168,16 +168,17 @@ async def _run_summarization(
             bot_text=clean_bot_text,
         )
 
-        logger.info(f"[{session_id}] Summarizing exchange with Gemini...")
+        logger.info(f"[{session_id}] Summarizing exchange with LLM provider...")
 
         contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
-        raw_response = await asyncio.to_thread(
-            gemini_service.generate_reply_from_contents,
-            contents,
+        raw_response = await (
+            llm_service.generate_reply_from_contents_async(
+                contents
+            )
         )
 
         if not raw_response:
-            logger.warning(f"[{session_id}] Gemini returned empty summary — using fallback")
+            logger.warning(f"[{session_id}] LLM returned empty summary — using fallback")
             raw_text = ""
         else:
             # Handle list or string content

@@ -4,12 +4,10 @@ from typing import Any, Dict, Optional
 
 from elevenlabs.core.api_error import ApiError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from google.genai.errors import APIError as GeminiApiError
-
 from audio.stt_deepgram import deepgram_stt
 from call.call_state_machine import CallState
 from call.session_manager import Session, session_manager
-from llm.gemini_service import AllGeminiKeysExhausted, gemini_service
+from llm.llm_service import AllLLMProvidersFailed, LLMApplicationError, llm_service
 from memory.context_builder import build_gemini_context
 from memory.memory_manager import memory_manager
 from memory.summarizer import summarize_exchange_in_background
@@ -23,6 +21,7 @@ router = APIRouter()
 
 _MIN_TRANSCRIPT_LENGTH = 2
 _JUNK_PHRASES = frozenset({"...", ". . ."})
+MAX_QUESTIONS_PER_DAY = 7
 
 
 def _valid_transcript(text: str) -> bool:
@@ -145,6 +144,7 @@ async def _process_turn(
     session: Session,
     websocket: WebSocket,
     user_text: str,
+    daily_usage_start: int,
 ) -> None:
     user_text = " ".join(user_text.split()).strip()
 
@@ -154,7 +154,7 @@ async def _process_turn(
             f"Transcript ignored: '{user_text}'"
         )
         return
-
+    
     if session.state_machine.state != CallState.LISTENING:
         logger.info(
             f"[{session.session_id}] "
@@ -162,8 +162,30 @@ async def _process_turn(
         )
         return
 
+    used_before_turn = (
+        daily_usage_start
+        + session.message_count
+    )
+
+    if used_before_turn >= MAX_QUESTIONS_PER_DAY:
+        logger.info(
+            f"[{session.session_id}] "
+            f"Daily browser question limit reached "
+            f"({MAX_QUESTIONS_PER_DAY})"
+        )
+
+        await websocket.send_json({
+            "type": "play_limit_reached",
+            "used": MAX_QUESTIONS_PER_DAY,
+            "limit": MAX_QUESTIONS_PER_DAY,
+        })
+
+        return
+
     session.interrupted = False
-    session.state_machine.transition(CallState.THINKING)
+    session.state_machine.transition(
+        CallState.THINKING
+    )
 
     turn_started = time.perf_counter()
     tts_connect_task = None
@@ -225,9 +247,12 @@ async def _process_turn(
 
         bot_parts = []
 
-        async def gemini_text_stream():
-            async for chunk in gemini_service.generate_reply_stream_from_contents(
-                contents
+        async def llm_text_stream():
+            async for chunk in (
+                llm_service
+                .generate_reply_stream_from_contents(
+                    contents
+                )
             ):
                 if chunk:
                     bot_parts.append(chunk)
@@ -243,7 +268,7 @@ async def _process_turn(
             audio_started = True
 
             async for packet in voice_manager.stream(
-                gemini_text_stream(),
+                llm_text_stream(),
                 ws=tts_ws,
             ):
                 if session.interrupted:
@@ -302,10 +327,10 @@ async def _process_turn(
 
                     await websocket.send_bytes(audio)
 
-        except AllGeminiKeysExhausted:
+        except AllLLMProvidersFailed as exc:
             logger.error(
                 f"[{session.session_id}] "
-                "All Gemini API keys exhausted"
+                f"All LLM providers failed: {exc}"
             )
 
             await _send_error(
@@ -314,10 +339,10 @@ async def _process_turn(
             )
             return
 
-        except GeminiApiError as exc:
+        except LLMApplicationError as exc:
             logger.error(
                 f"[{session.session_id}] "
-                f"Gemini API error: {exc}"
+                f"LLM application error: {exc}"
             )
 
             await _send_error(
@@ -379,7 +404,7 @@ async def _process_turn(
         if not bot_text:
             logger.warning(
                 f"[{session.session_id}] "
-                "Gemini returned empty response"
+                "LLM returned empty response"
             )
 
             await _send_error(
@@ -400,6 +425,18 @@ async def _process_turn(
         ])
 
         session.message_count = message_count + 1
+
+        daily_used = min(
+            MAX_QUESTIONS_PER_DAY,
+            daily_usage_start
+            + session.message_count,
+        )
+
+        await websocket.send_json({
+            "type": "usage_update",
+            "used": daily_used,
+            "limit": MAX_QUESTIONS_PER_DAY,
+        })
 
         session.last_messages = {
             "user": user_text,
@@ -533,6 +570,7 @@ async def _consume_deepgram_utterances(
     session: Session,
     websocket: WebSocket,
     deepgram_session,
+    daily_usage_start: int,
 ) -> None:
     try:
         while True:
@@ -543,6 +581,7 @@ async def _consume_deepgram_utterances(
                     session=session,
                     websocket=websocket,
                     user_text=user_text,
+                    daily_usage_start=daily_usage_start,
                 )
 
     except asyncio.CancelledError:
@@ -557,6 +596,24 @@ async def _consume_deepgram_utterances(
 
 @router.websocket("/ws/call")
 async def call_websocket(websocket: WebSocket) -> None:
+    try:
+        daily_usage_start = int(
+            websocket.query_params.get(
+                "used",
+                "0",
+            )
+        )
+    except (TypeError, ValueError):
+        daily_usage_start = 0
+
+    daily_usage_start = max(
+        0,
+        min(
+            MAX_QUESTIONS_PER_DAY,
+            daily_usage_start,
+        ),
+    )
+
     await websocket.accept()
 
     session = session_manager.create_session()
@@ -564,24 +621,52 @@ async def call_websocket(websocket: WebSocket) -> None:
     deepgram_session = None
     utterance_task = None
     event_task = None
-
-    memory_task = asyncio.create_task(
-        memory_manager.create_session(
-            session.session_id
-        )
-    )
-
-    deepgram_task = asyncio.create_task(
-        deepgram_stt.create_session(
-            session.session_id
-        )
-    )
+    memory_task = None
+    deepgram_task = None
 
     try:
         await websocket.send_json({
             "type": "session_started",
             "session_id": session.session_id,
         })
+
+        logger.info(
+            f"[{session.session_id}] "
+            f"Browser daily usage at call start: "
+            f"{daily_usage_start}/{MAX_QUESTIONS_PER_DAY}"
+        )
+
+        if daily_usage_start >= MAX_QUESTIONS_PER_DAY:
+            logger.info(
+                f"[{session.session_id}] "
+                "Daily browser question limit already reached"
+            )
+
+            await websocket.send_json({
+                "type": "play_limit_reached",
+                "used": MAX_QUESTIONS_PER_DAY,
+                "limit": MAX_QUESTIONS_PER_DAY,
+            })
+
+            while True:
+                message = await websocket.receive()
+
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(
+                        code=message.get("code", 1000)
+                    )
+
+        memory_task = asyncio.create_task(
+            memory_manager.create_session(
+                session.session_id
+            )
+        )
+
+        deepgram_task = asyncio.create_task(
+            deepgram_stt.create_session(
+                session.session_id
+            )
+        )
 
         await websocket.send_json({
             "type": "play_greeting",
@@ -614,6 +699,7 @@ async def call_websocket(websocket: WebSocket) -> None:
                 session=session,
                 websocket=websocket,
                 deepgram_session=deepgram_session,
+                daily_usage_start=daily_usage_start,
             ),
             name=f"deepgram-consumer-{session.session_id}",
         )
