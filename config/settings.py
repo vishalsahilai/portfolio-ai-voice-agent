@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY4: str = ""
 
     DEEPGRAM_MODEL: str = "nova-3"
-    DEEPGRAM_LANGUAGE: str = "en-US"
+    DEEPGRAM_LANGUAGE: str = "multi"
     DEEPGRAM_ENDPOINTING_MS: int = 350
     DEEPGRAM_UTTERANCE_END_MS: int = 1000
 
