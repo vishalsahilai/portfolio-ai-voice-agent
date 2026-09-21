@@ -2,10 +2,20 @@ const WS_URL =
   window.location.hostname === "localhost"
     ? "ws://localhost:8001/ws/call"
     : "wss://portfolio-ai-voice-agent.onrender.com/ws/call";
+
+const BACKEND_WAKE_URL =
+  window.location.hostname === "localhost"
+    ? "http://localhost:8001/"
+    : "https://portfolio-ai-voice-agent.onrender.com/";
+
 const TARGET_SAMPLE_RATE = 16000;
 const STREAM_MIME = "audio/mpeg";
 const DAILY_QUESTION_LIMIT = 7;
 const DAILY_USAGE_KEY = "sada_voice_daily_usage";
+
+const MAX_CONNECTION_RETRIES = 8;
+const CONNECTION_RETRY_DELAY_MS = 1500;
+const WS_CONNECT_TIMEOUT_MS = 6000;
 
 const callBtn = document.getElementById("callBtn");
 const statusEl = document.getElementById("status");
@@ -22,6 +32,11 @@ let silentGainNode = null;
 let isCallActive = false;
 let isConnecting = false;
 let canSendMic = false;
+
+let greetingFinished = false;
+let voiceReady = false;
+let connectionRetryCount = 0;
+let connectionRetryTimer = null;
 
 let greetingAudio = null;
 let limitAudio = null;
@@ -110,6 +125,8 @@ function resampleAudio(input, inputRate, outputRate) {
 function setListening() {
   if (
     !isCallActive ||
+    !greetingFinished ||
+    !voiceReady ||
     !ws ||
     ws.readyState !== WebSocket.OPEN
   ) {
@@ -118,6 +135,11 @@ function setListening() {
 
   canSendMic = true;
   statusEl.textContent = "Listening...";
+}
+
+
+function tryStartListening() {
+  setListening();
 }
 
 
@@ -1054,6 +1076,7 @@ async function startMic() {
 function playGreeting() {
   stopAllAgentAudio(false);
 
+  greetingFinished = false;
   setAgentBusy("Agent greeting...");
 
   greetingAudio =
@@ -1063,13 +1086,14 @@ function playGreeting() {
 
   greetingAudio.onended = () => {
     greetingAudio = null;
+    greetingFinished = true;
 
     log(
-      "Greeting finished — listening",
+      "Greeting finished",
       "system"
     );
 
-    setListening();
+    tryStartListening();
   };
 
   greetingAudio.onerror = () => {
@@ -1079,7 +1103,9 @@ function playGreeting() {
     );
 
     greetingAudio = null;
-    setListening();
+    greetingFinished = true;
+
+    tryStartListening();
   };
 
   greetingAudio.play().catch((err) => {
@@ -1089,7 +1115,9 @@ function playGreeting() {
     );
 
     greetingAudio = null;
-    setListening();
+    greetingFinished = true;
+
+    tryStartListening();
   });
 
   log(
@@ -1097,7 +1125,6 @@ function playGreeting() {
     "agent"
   );
 }
-
 
 function playLimitReachedAudio() {
   canSendMic = false;
@@ -1152,19 +1179,38 @@ function handleControlMessage(msg) {
   switch (msg.type) {
 
     case "session_started":
-      statusEl.textContent =
-        `In call (${msg.session_id.slice(0, 8)}...)`;
+      if (!greetingFinished) {
+        statusEl.textContent =
+          "Agent greeting...";
+      } else if (!voiceReady) {
+        statusEl.textContent =
+          "Connected — preparing agent...";
+      }
 
       log(
-        "Call connected",
+        `Call connected (${msg.session_id.slice(0, 8)}...)`,
         "system"
       );
 
       break;
 
 
+    case "voice_ready":
+      voiceReady = true;
+
+      log(
+        "Voice pipeline ready",
+        "system"
+      );
+
+      tryStartListening();
+      break;
+
+
+    // Backward compatibility only.
+    // The greeting is now frontend-controlled,
+    // so an old backend play_greeting message is ignored.
     case "play_greeting":
-      playGreeting();
       break;
 
 
@@ -1278,6 +1324,267 @@ function handleControlMessage(msg) {
 // CALL
 // --------------------------------------------------
 
+async function wakeBackend() {
+  if (window.location.hostname === "localhost") {
+    return;
+  }
+
+  try {
+    await fetch(BACKEND_WAKE_URL, {
+      method: "GET",
+      mode: "no-cors",
+      cache: "no-store",
+      keepalive: true,
+    });
+  } catch (_) {
+    // Ignore wake-up errors.
+    // The WebSocket retry flow will keep trying if Render is still waking.
+  }
+}
+
+
+function clearConnectionRetryTimer() {
+  if (connectionRetryTimer !== null) {
+    clearTimeout(connectionRetryTimer);
+    connectionRetryTimer = null;
+  }
+}
+
+
+function scheduleConnectionRetry() {
+  if (
+    !isCallActive ||
+    voiceReady
+  ) {
+    return;
+  }
+
+  if (
+    connectionRetryCount >=
+    MAX_CONNECTION_RETRIES
+  ) {
+    const wasActive =
+      isCallActive ||
+      isConnecting;
+
+    cleanupCall(false);
+
+    statusEl.textContent =
+      "Could not connect to voice agent";
+
+    if (wasActive) {
+      log(
+        "Voice backend did not become ready in time.",
+        "system"
+      );
+    }
+
+    return;
+  }
+
+  connectionRetryCount++;
+
+  statusEl.textContent =
+    "Waking voice agent...";
+
+  log(
+    `Retrying backend connection (${connectionRetryCount}/${MAX_CONNECTION_RETRIES})`,
+    "system"
+  );
+
+  void wakeBackend();
+
+  clearConnectionRetryTimer();
+
+  connectionRetryTimer =
+    setTimeout(() => {
+      connectionRetryTimer = null;
+
+      if (
+        isCallActive &&
+        !voiceReady
+      ) {
+        connectVoiceWebSocket();
+      }
+    }, CONNECTION_RETRY_DELAY_MS);
+}
+
+
+function connectVoiceWebSocket() {
+  if (
+    !isCallActive ||
+    voiceReady
+  ) {
+    return;
+  }
+
+  clearConnectionRetryTimer();
+
+  const usedToday =
+    getDailyUsage();
+
+  const socketUrl =
+    new URL(WS_URL);
+
+  socketUrl.searchParams.set(
+    "used",
+    String(usedToday)
+  );
+
+  const socket =
+    new WebSocket(
+      socketUrl.toString()
+    );
+
+  ws = socket;
+
+  socket.binaryType =
+    "arraybuffer";
+
+  const connectTimeout =
+    setTimeout(() => {
+      if (
+        !isCallActive ||
+        ws !== socket ||
+        socket.readyState !==
+          WebSocket.CONNECTING
+      ) {
+        return;
+      }
+
+      statusEl.textContent =
+        "Waking voice agent...";
+
+      log(
+        "Backend is still waking up...",
+        "system"
+      );
+
+      void wakeBackend();
+
+      try {
+        socket.close();
+      } catch (_) {}
+    }, WS_CONNECT_TIMEOUT_MS);
+
+  socket.onopen = () => {
+    clearTimeout(connectTimeout);
+
+    if (
+      !isCallActive ||
+      ws !== socket
+    ) {
+      try {
+        socket.close();
+      } catch (_) {}
+
+      return;
+    }
+
+    isConnecting = false;
+    connectionRetryCount = 0;
+
+    callBtn.textContent =
+      "End Call";
+
+    if (!greetingFinished) {
+      statusEl.textContent =
+        "Agent greeting...";
+    } else {
+      statusEl.textContent =
+        "Connected — preparing agent...";
+    }
+
+    log(
+      "WebSocket connected",
+      "system"
+    );
+  };
+
+  socket.onmessage = (event) => {
+    if (
+      !isCallActive ||
+      ws !== socket
+    ) {
+      return;
+    }
+
+    if (
+      typeof event.data === "string"
+    ) {
+      try {
+        handleControlMessage(
+          JSON.parse(event.data)
+        );
+
+      } catch (err) {
+        log(
+          `Invalid server message: ${err.message}`,
+          "system"
+        );
+      }
+
+      return;
+    }
+
+    appendStreamAudio(
+      event.data
+    );
+  };
+
+  socket.onerror = () => {
+    if (
+      !isCallActive ||
+      ws !== socket
+    ) {
+      return;
+    }
+
+    statusEl.textContent =
+      "Waking voice agent...";
+
+    log(
+      "WebSocket connection is not ready yet.",
+      "system"
+    );
+  };
+
+  socket.onclose = () => {
+    clearTimeout(connectTimeout);
+
+    if (ws === socket) {
+      ws = null;
+    }
+
+    if (!isCallActive) {
+      return;
+    }
+
+    if (!voiceReady) {
+      isConnecting = true;
+      scheduleConnectionRetry();
+      return;
+    }
+
+    const wasActive =
+      isCallActive ||
+      isConnecting;
+
+    cleanupCall(false);
+
+    if (wasActive) {
+      statusEl.textContent =
+        "Disconnected";
+
+      log(
+        "WebSocket closed",
+        "system"
+      );
+    }
+  };
+}
+
+
 async function startCall() {
   if (
     getDailyUsage() >=
@@ -1287,10 +1594,20 @@ async function startCall() {
     return;
   }
 
-  if (isConnecting || isCallActive) return;
+  if (
+    isConnecting ||
+    isCallActive
+  ) {
+    return;
+  }
 
   isConnecting = true;
+  isCallActive = true;
   canSendMic = false;
+
+  greetingFinished = false;
+  voiceReady = false;
+  connectionRetryCount = 0;
 
   resetUserTranscript();
 
@@ -1302,98 +1619,34 @@ async function startCall() {
   );
 
   statusEl.textContent =
-    "Preparing audio...";
+    "Starting voice agent...";
+
+  /*
+   * The greeting belongs completely to the frontend.
+   * It starts immediately from the user's Start Call click
+   * and does not wait for Render, Deepgram, Qwen, or ElevenLabs.
+   */
+  playGreeting();
+
+  /*
+   * Wake Render again at call start.
+   * A separate wake-up is also sent when this JS file loads.
+   */
+  void wakeBackend();
 
   try {
     await prepareAudioContext();
+
+    /*
+     * Prepare the microphone now, but microphone frames are
+     * blocked until BOTH:
+     *
+     *   greetingFinished === true
+     *   voiceReady === true
+     */
     await startMic();
 
-    isCallActive = true;
-
-    const usedToday =
-      getDailyUsage();
-
-    const socketUrl =
-      new URL(WS_URL);
-
-    socketUrl.searchParams.set(
-      "used",
-      String(usedToday)
-    );
-
-    ws =
-      new WebSocket(
-        socketUrl.toString()
-      );
-
-    ws.binaryType =
-      "arraybuffer";
-
-    ws.onopen = () => {
-      isConnecting = false;
-
-      callBtn.textContent =
-        "End Call";
-
-      statusEl.textContent =
-        "Connected — preparing agent...";
-
-      log(
-        "WebSocket connected",
-        "system"
-      );
-    };
-
-    ws.onmessage = (event) => {
-      if (!isCallActive) return;
-
-      if (
-        typeof event.data === "string"
-      ) {
-        try {
-          handleControlMessage(
-            JSON.parse(event.data)
-          );
-
-        } catch (err) {
-          log(
-            `Invalid server message: ${err.message}`,
-            "system"
-          );
-        }
-
-        return;
-      }
-
-      appendStreamAudio(
-        event.data
-      );
-    };
-
-    ws.onerror = () => {
-      log(
-        "WebSocket connection error.",
-        "system"
-      );
-    };
-
-    ws.onclose = () => {
-      const wasActive =
-        isCallActive ||
-        isConnecting;
-
-      cleanupCall(false);
-
-      if (wasActive) {
-        statusEl.textContent =
-          "Disconnected";
-
-        log(
-          "WebSocket closed",
-          "system"
-        );
-      }
-    };
+    connectVoiceWebSocket();
 
   } catch (err) {
     log(
@@ -1408,11 +1661,16 @@ async function startCall() {
   }
 }
 
-
 function cleanupCall(closeSocket = true) {
   canSendMic = false;
   isCallActive = false;
   isConnecting = false;
+
+  greetingFinished = false;
+  voiceReady = false;
+  connectionRetryCount = 0;
+
+  clearConnectionRetryTimer();
 
   stopCaptionSync();
   stopAllAgentAudio(false);

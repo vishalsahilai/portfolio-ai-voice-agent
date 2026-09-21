@@ -1,8 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from api.health_routes import router as health_router
 from api.websocket_routes import router as websocket_router
@@ -11,6 +13,22 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+# =========================================================
+# STATIC AUDIO FILES
+# =========================================================
+
+LIMIT_AUDIO_PATH = (
+    Path(__file__).resolve().parent
+    / "audio"
+    / "static"
+    / "limit-reached.mp3"
+)
+
+
+# =========================================================
+# STARTUP SERVICES
+# =========================================================
 
 async def _init_memory() -> None:
     try:
@@ -46,6 +64,10 @@ async def _warmup_services() -> None:
         )
 
 
+# =========================================================
+# APP LIFESPAN
+# =========================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
@@ -78,6 +100,10 @@ async def lifespan(app: FastAPI):
     )
 
 
+# =========================================================
+# CREATE APP
+# =========================================================
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI Voice Agent — Sada",
@@ -92,6 +118,36 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+    # =====================================================
+    # LIMIT REACHED AUDIO
+    # =====================================================
+
+    @app.get(
+        "/limit-reached.mp3",
+        include_in_schema=False,
+    )
+    async def limit_reached_audio():
+        if not LIMIT_AUDIO_PATH.is_file():
+            logger.error(
+                f"Limit audio not found: {LIMIT_AUDIO_PATH}"
+            )
+
+            raise HTTPException(
+                status_code=404,
+                detail="Limit audio not found",
+            )
+
+        return FileResponse(
+            path=LIMIT_AUDIO_PATH,
+            media_type="audio/mpeg",
+        )
+
+
+    # =====================================================
+    # ROUTERS
+    # =====================================================
 
     app.include_router(
         health_router

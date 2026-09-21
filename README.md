@@ -1272,13 +1272,25 @@ Make sure ingestion and querying both use the same embedding model (`llama-text-
 
 ---
 
-### 6. Start the application
+### 6.1 Start the backend
 
 ```bash
 
+cd backend
 python main.py
 
 ```
+### 6.2 Start the frontend
+
+```bash
+
+cd frontend
+python3 -m http.server 3000
+
+then http://localhost:3000
+
+```
+
 
 Expected startup output includes messages similar to:
 
